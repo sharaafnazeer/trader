@@ -1,0 +1,110 @@
+# Personal watchlist — the 87-symbol "Bitfunded Coins LATEST" list, normalized to
+# Binance-spot format. Non-Binance-spot symbols (stocks, commodities, some perps-only
+# tokens) are fetched if Binance serves them and skipped gracefully otherwise; the
+# multi-factor model is designed for crypto, so treat non-crypto rows with skepticism.
+#
+# Usage:
+#   uv run trader scan --config mywatch.yaml --all
+#   uv run trader backtest --config mywatch.yaml --from 2022-01-01 --to 2025-12-31
+#   uv run trader refresh-cache --config mywatch.yaml     # nightly, keeps the cache warm
+profile: futures
+
+# Larger delay between TradingView requests to reduce 429 rate-limiting on big scans.
+tradingview_delay: 3.5
+
+backtest:
+  cache_dir: /Users/sharaafnazeer/Own/trader/.cache/backtest
+  fee_rate: 0.0004
+  slippage: 0.0005
+  risk_per_trade: 0.01
+  max_workers: 5
+  history_horizon_days: 1825   # 5 years (730=2y, 1460=4y)
+
+watchlist:
+  - BOMEUSDT
+  - OPENAIUSDT
+  - FLOKIUSDT
+  - TAOUSDT
+  - PEPEUSDT
+  - ORDIUSDT
+  - LDOUSDT
+  - ETHUSDT
+  - XRPUSDT
+  - ONDOUSDT
+  - SOLUSDT
+  - STXUSDT
+  - HYPEUSDT
+  - SHIBUSDT
+  - PUMPUSDT
+  - ENAUSDT
+  - SEIUSDT
+  - BONKUSDT
+  - APEUSDT
+  - LITUSDT
+  - DOTUSDT
+  - SAGAUSDT
+  - TIAUSDT
+  - ETHFIUSDT
+  - ARBUSDT
+  - ATOMUSDT
+  - BRETTUSDT
+  - OPUSDT
+  - ASTERUSDT
+  - ADAUSDT
+  - WLFIUSDT
+  - LTCUSDT
+  - BCHUSDT
+  - WIFUSDT
+  - UNIUSDT
+  - CLUSDT
+  - JUPUSDT
+  - AAPLUSDT
+  - AVAXUSDT
+  - SUIUSDT
+  - BZUSDT
+  - FILUSDT
+  - TRXUSDT
+  - METAUSDT
+  - BNBUSDT
+  - GALAUSDT
+  - JTOUSDT
+  - AMZNUSDT
+  - SPYUSDT
+  - ICPUSDT
+  - IMXUSDT
+  - MELANIAUSDT
+  - JASMYUSDT
+  - VETUSDT
+  - INJUSDT
+  - CHZUSDT
+  - BTCUSDT
+  - LINKUSDT
+  - DOGEUSDT
+  - VIRTUALUSDT
+  - XAUUSDT
+  - NATGASUSDT
+  - COPPERUSDT
+  - MSTRUSDT
+  - ARUSDT
+  - APTUSDT
+  - XPTUSDT
+  - PIPPINUSDT
+  - MINAUSDT
+  - QQQUSDT
+  - COMPUSDT
+  - PENDLEUSDT
+  - BEAMXUSDT
+  - ENSUSDT
+  - GRTUSDT
+  - CFXUSDT
+  - HOODUSDT
+  - TSLAUSDT
+  - RIVERUSDT
+  - SPCXUSDT
+  - FETUSDT
+  - ZECUSDT
+  - TRUMPUSDT
+  - XAGUSDT
+  - WLDUSDT
+  - LINEAUSDT
+  - PYTHUSDT

@@ -1,0 +1,119 @@
+{
+  "ranking": [
+    {
+      "symbol": "ETHUSDT",
+      "score": -2.0,
+      "signal": "NEUTRAL",
+      "breakdown": [
+        {
+          "interval": "15m",
+          "recommendation": "NEUTRAL",
+          "buy": 9,
+          "neutral": 9,
+          "sell": 8
+        },
+        {
+          "interval": "1h",
+          "recommendation": "SELL",
+          "buy": 2,
+          "neutral": 10,
+          "sell": 14
+        },
+        {
+          "interval": "4h",
+          "recommendation": "NEUTRAL",
+          "buy": 7,
+          "neutral": 9,
+          "sell": 10
+        },
+        {
+          "interval": "1d",
+          "recommendation": "NEUTRAL",
+          "buy": 7,
+          "neutral": 10,
+          "sell": 9
+        }
+      ]
+    },
+    {
+      "symbol": "SOLUSDT",
+      "score": -13.0,
+      "signal": "SELL",
+      "breakdown": [
+        {
+          "interval": "15m",
+          "recommendation": "NEUTRAL",
+          "buy": 8,
+          "neutral": 10,
+          "sell": 8
+        },
+        {
+          "interval": "1h",
+          "recommendation": "SELL",
+          "buy": 3,
+          "neutral": 9,
+          "sell": 14
+        },
+        {
+          "interval": "4h",
+          "recommendation": "SELL",
+          "buy": 4,
+          "neutral": 8,
+          "sell": 14
+        },
+        {
+          "interval": "1d",
+          "recommendation": "STRONG_SELL",
+          "buy": 0,
+          "neutral": 10,
+          "sell": 16
+        }
+      ]
+    },
+    {
+      "symbol": "BTCUSDT",
+      "score": -14.0,
+      "signal": "SELL",
+      "breakdown": [
+        {
+          "interval": "15m",
+          "recommendation": "SELL",
+          "buy": 4,
+          "neutral": 9,
+          "sell": 13
+        },
+        {
+          "interval": "1h",
+          "recommendation": "SELL",
+          "buy": 2,
+          "neutral": 10,
+          "sell": 14
+        },
+        {
+          "interval": "4h",
+          "recommendation": "SELL",
+          "buy": 4,
+          "neutral": 9,
+          "sell": 13
+        },
+        {
+          "interval": "1d",
+          "recommendation": "STRONG_SELL",
+          "buy": 1,
+          "neutral": 10,
+          "sell": 15
+        }
+      ]
+    }
+  ],
+  "failures": [
+    {
+      "symbol": "XRPUSDT",
+      "reason": "Can't access TradingView's API. HTTP status code: 429. Check for invalid symbol, exchange, or indicators."
+    },
+    {
+      "symbol": "ADAUSDT",
+      "reason": "Can't access TradingView's API. HTTP status code: 429. Check for invalid symbol, exchange, or indicators."
+    }
+  ]
+}
