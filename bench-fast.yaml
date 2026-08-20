@@ -1,0 +1,37 @@
+# VARIANT: "3-4 trades a day" experiment. 4h leads instead of 1d and levels come from 1h,
+# so signals turn over far faster. 5m is not cached (would need ~470k candles/coin), so 15m
+# is the fastest rung. Everything else is identical to bench-slow.yaml.
+profile: futures
+timeframes: [15m, 1h, 4h]
+htf_timeframes: [1h, 4h]
+lead_timeframe: 4h
+reference_timeframe: 1h
+watchlist:
+  - BTCUSDT
+  - ETHUSDT
+  - SOLUSDT
+  - XRPUSDT
+  - BNBUSDT
+  - ADAUSDT
+  - DOGEUSDT
+  - LINKUSDT
+  - AVAXUSDT
+  - DOTUSDT
+  - LTCUSDT
+  - TRXUSDT
+  - ATOMUSDT
+  - UNIUSDT
+  - FILUSDT
+  - APTUSDT
+  - ARBUSDT
+  - OPUSDT
+  - INJUSDT
+  - SEIUSDT
+
+backtest:
+  cache_dir: /Users/sharaafnazeer/Own/trader/.cache/backtest
+  fee_rate: 0.0004
+  slippage: 0.0005
+  risk_per_trade: 0.01
+  max_workers: 5
+  history_horizon_days: 1825

@@ -10,7 +10,6 @@ import pandas as pd
 
 from trader.direction import Direction
 from trader.market_data import Candles
-from trader.scoring_model import _rr_fraction
 from trader.structure import Structure, StructureState
 from trader.trade_planner import TradePlanner
 
@@ -106,10 +105,3 @@ def test_plan_is_none_without_direction_or_invalidation() -> None:
     assert TradePlanner().plan(Direction.NONE, _candles(100.0), pivots, ATR) is None
     # A long with no swing low has no invalidation level, so no plan can be built.
     assert TradePlanner().plan(Direction.LONG, _candles(100.0), empty, ATR) is None
-
-
-def test_risk_reward_fraction_full_at_target_reduced_below_and_zero_without_plan() -> None:
-    assert _rr_fraction(TARGET_RR, TARGET_RR) == 1.0  # exactly at target -> full
-    assert _rr_fraction(3.0, TARGET_RR) == 1.0  # above target -> full (clamped)
-    assert _rr_fraction(1.0, TARGET_RR) == 0.5  # half the target -> half credit
-    assert _rr_fraction(None, TARGET_RR) == 0.0  # no plan -> no credit

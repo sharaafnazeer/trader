@@ -39,12 +39,19 @@ class StructureState:
 
     ``swing_highs`` / ``swing_lows`` are the detected pivot prices in chronological
     order; they double as the support/resistance levels consumed downstream by the
-    trade planner.
+    trade planner. ``swing_high_indices`` / ``swing_low_indices`` are their bar positions,
+    which the trendline fitter needs to draw a line through them.
     """
 
     structure: Structure
     swing_highs: tuple[float, ...]
     swing_lows: tuple[float, ...]
+    # Bar positions of those pivots, in the same order. Default empty so existing
+    # constructions stay valid. The detector always knew *when* each swing happened and
+    # used to discard it; a trendline cannot be fitted to prices without their dates, and
+    # re-detecting them elsewhere would create a second answer to "where are the swings".
+    swing_high_indices: tuple[int, ...] = ()
+    swing_low_indices: tuple[int, ...] = ()
 
     @property
     def last_swing_high(self) -> float | None:
@@ -119,4 +126,6 @@ def analyze(candles: Candles, *, swing_window: int = DEFAULT_SWING_WINDOW) -> St
         structure=_classify(swing_highs, swing_lows),
         swing_highs=swing_highs,
         swing_lows=swing_lows,
+        swing_high_indices=tuple(high_idx),
+        swing_low_indices=tuple(low_idx),
     )

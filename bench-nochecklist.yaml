@@ -1,0 +1,170 @@
+# CONTROL for the strategy-catalogue measurement: identical to mywatch.yaml with the
+# checklist switched off, so the only difference between the two runs is the checklist
+# itself. Same code, same window, same costs, same watchlist.
+# Personal watchlist — the "Bitfunded Coins LATEST" list (86 symbols), normalized to
+# Binance-spot format. Non-Binance-spot symbols (stocks, commodities, some perps-only
+# tokens) are fetched if Binance serves them and skipped gracefully otherwise; the
+# multi-factor model is designed for crypto, so treat non-crypto rows with skepticism.
+#
+# Usage:
+#   uv run trader scan --config mywatch.yaml --all
+#   uv run trader backtest --config mywatch.yaml --from 2022-01-01 --to 2025-12-31
+#   uv run trader refresh-cache --config mywatch.yaml     # nightly, keeps the cache warm
+#
+# With the AI analyst (see the `ai:` block below — off by default):
+#   uv run trader scan --config mywatch.yaml --dry-run-ai   # free: what would be sent
+#   uv run trader scan --config mywatch.yaml --ai           # paid: one request per run
+profile: futures
+
+# Larger delay between TradingView requests to reduce 429 rate-limiting on big scans.
+tradingview_delay: 3.5
+
+# --- AI analyst (off by default) ---
+# Reviews the setups the engine surfaces and returns LONG/SHORT/WAIT/AVOID with levels.
+# Flip `enabled` to true, then start with `--dry-run-ai` to see the payload for free.
+# No credentials here — the key is read from $OPENAI_API_KEY.
+ai:
+  enabled: true
+  # These three are tuned together against a measured pass over this watchlist
+  # (2026-08-18): 51 coins scored, top score 79.2, and 44 of 51 were SHORT.
+  #
+  # `min_score` is the MOMENTUM scanner's floor, measured against its 0-100 composite. It no
+  # longer applies to `scan`: the trend engine's 0-100 quality score was retired along with
+  # the indicators behind it, and which coins reach the analyst is now decided by
+  # `strategies.review_within` in checklist terms.
+  min_score: 50
+  # `reserve_per_direction: 4` with `max_candidates: 8` guarantees 4 long + 4 short slots.
+  # Ranking purely by score gave 5 shorts and zero longs — the correlated-cluster pattern
+  # behind the engine's 75% backtest drawdown. Reserve 2 / cap 5 was NOT enough to reach
+  # the 4th-best long; these numbers are what actually do it.
+  max_candidates: 8
+  reserve_per_direction: 4
+  model: gpt-5
+  api_key_env: OPENAI_API_KEY
+  # Set these to your model's real prices to get a dollar estimate per run; left at 0
+  # the run honestly reports "cost not configured" instead of a misleading $0.00.
+  input_cost_per_mtok: 1.25   # gpt-5 published rate; verify on your billing page
+  output_cost_per_mtok: 10.0   # gpt-5 published rate
+  decision_log: /Users/sharaafnazeer/Own/trader/.cache/decisions.jsonl
+
+# --- Telegram alerts (off by default) ---
+# Pushes high-confidence LONG/SHORT verdicts to your phone. WAIT/AVOID never alert.
+# Credentials come from $TELEGRAM_BOT_TOKEN and $TELEGRAM_CHAT_ID.
+telegram:
+  enabled: false
+  min_confidence: 70
+
+# --- Named strategies (the checklist) ---
+# Defaults shown. See the README's "Strategies" section for what each condition means; the
+# rules themselves live in .sdd/strategy-catalogue/rules.md.
+strategies:
+  enabled: false
+  max_extension_atr: 2.0        # ATR beyond the EMA21-EMA50 zone before the entry is a chase
+  stoch_oversold: 0.20          # extreme a bullish momentum turn must come from (0-1 scale)
+  stoch_overbought: 0.80        # ...and a bearish one
+  cross_lookback: 3             # bars ago a cross may be and still count as "just turned"
+  pattern_wick_body_ratio: 2.0  # times its body a wick must be to count as a rejection
+  reaction_lookback: 3          # recent bars the reaction candle may have formed on
+  trendline_min_touches: 3      # pivots needed to call it a line
+  trendline_min_r2: 0.7         # how well they must lie on it, 0-1
+  trendline_tolerance_atr: 1.5  # how near price must be to have "returned to" the line
+  review_within: 2              # conditions short of complete and still worth an AI opinion
+  evidence_candles: 30          # recent bars sent to the analyst with the evidence
+
+backtest:
+  cache_dir: /Users/sharaafnazeer/Own/trader/.cache/backtest
+  fee_rate: 0.0004
+  slippage: 0.0005
+  risk_per_trade: 0.01
+  max_workers: 5
+  history_horizon_days: 1825   # 5 years (730=2y, 1460=4y)
+
+watchlist:
+  - BOMEUSDT
+  - OPENAIUSDT
+  - FLOKIUSDT
+  - TAOUSDT
+  - PEPEUSDT
+  - ORDIUSDT
+  - LDOUSDT
+  - ETHUSDT
+  - XRPUSDT
+  - ONDOUSDT
+  - SOLUSDT
+  - STXUSDT
+  - HYPEUSDT
+  - SHIBUSDT
+  - PUMPUSDT
+  - ENAUSDT
+  - SEIUSDT
+  - BONKUSDT
+  - APEUSDT
+  # LITUSDT removed 2026-08-19: delisted from Binance spot (its order book comes
+  # back with no bids), so every scan skipped it and warned about it.
+  - DOTUSDT
+  - SAGAUSDT
+  - TIAUSDT
+  - ETHFIUSDT
+  - ARBUSDT
+  - ATOMUSDT
+  - BRETTUSDT
+  - OPUSDT
+  - ASTERUSDT
+  - ADAUSDT
+  - WLFIUSDT
+  - LTCUSDT
+  - BCHUSDT
+  - WIFUSDT
+  - UNIUSDT
+  - CLUSDT
+  - JUPUSDT
+  - AAPLUSDT
+  - AVAXUSDT
+  - SUIUSDT
+  - BZUSDT
+  - FILUSDT
+  - TRXUSDT
+  - METAUSDT
+  - BNBUSDT
+  - GALAUSDT
+  - JTOUSDT
+  - AMZNUSDT
+  - SPYUSDT
+  - ICPUSDT
+  - IMXUSDT
+  - MELANIAUSDT
+  - JASMYUSDT
+  - VETUSDT
+  - INJUSDT
+  - CHZUSDT
+  - BTCUSDT
+  - LINKUSDT
+  - DOGEUSDT
+  - VIRTUALUSDT
+  - XAUUSDT
+  - NATGASUSDT
+  - COPPERUSDT
+  - MSTRUSDT
+  - ARUSDT
+  - APTUSDT
+  - XPTUSDT
+  - PIPPINUSDT
+  - MINAUSDT
+  - QQQUSDT
+  - COMPUSDT
+  - PENDLEUSDT
+  - BEAMXUSDT
+  - ENSUSDT
+  - GRTUSDT
+  - CFXUSDT
+  - HOODUSDT
+  - TSLAUSDT
+  - RIVERUSDT
+  - SPCXUSDT
+  - FETUSDT
+  - ZECUSDT
+  - TRUMPUSDT
+  - XAGUSDT
+  - WLDUSDT
+  - LINEAUSDT
+  - PYTHUSDT

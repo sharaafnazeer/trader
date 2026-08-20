@@ -10,7 +10,7 @@ from __future__ import annotations
 import pandas as pd
 
 from trader.backtester import Backtester
-from trader.config import Config, resolve_profile
+from trader.config import Config, StrategyConfig, resolve_profile
 from trader.direction import Direction
 from trader.market_data import Candles
 from trader.replay import Replay, timeframe_to_ms
@@ -45,7 +45,9 @@ def _futures_config() -> Config:
         reference_timeframe="4h",
         lead_timeframe="4h",
         htf_timeframes=["4h"],
-        quality_threshold=0.0,
+        # Replay machinery under test, not the method: a synthetic series cannot satisfy a
+        # seven-condition checklist, and leaving it on would pin zero trades.
+        strategies=StrategyConfig(enabled=False),
     )
 
 
@@ -56,8 +58,8 @@ def _futures_config() -> Config:
 
 def test_only_trades_entered_within_the_range_are_counted() -> None:
     config = _futures_config()
-    histories = {"AAA": _aligned("AAA", ["1h", "4h"], "4h", 80)}
-    btc = _aligned("BTC/USDT", ["1h", "4h"], "4h", 80)
+    histories = {"AAA": _aligned("AAA", ["1h", "4h"], "4h", 260)}
+    btc = _aligned("BTC/USDT", ["1h", "4h"], "4h", 260)
 
     # Ungated: the persistent bullish signal enters once, at its natural first close.
     ungated = Backtester().run(config, histories, btc)
@@ -85,8 +87,8 @@ def test_only_trades_entered_within_the_range_are_counted() -> None:
 
 def test_futures_profile_produces_trades() -> None:
     config = _futures_config()
-    histories = {"AAA": _aligned("AAA", ["1h", "4h"], "4h", 80)}
-    btc = _aligned("BTC/USDT", ["1h", "4h"], "4h", 80)
+    histories = {"AAA": _aligned("AAA", ["1h", "4h"], "4h", 260)}
+    btc = _aligned("BTC/USDT", ["1h", "4h"], "4h", 260)
 
     run = Backtester().run(config, histories, btc)
     assert len(run.outcomes) >= 1
@@ -102,12 +104,16 @@ def test_spot_profile_produces_trades() -> None:
         reference_timeframe=resolved.reference_timeframe,
         lead_timeframe=resolved.lead_timeframe,
         htf_timeframes=resolved.htf_timeframes,
-        quality_threshold=0.0,
+        # Replay machinery under test, not the method: a synthetic series cannot satisfy a
+        # seven-condition checklist, and leaving it on would pin zero trades.
+        strategies=StrategyConfig(enabled=False),
     )
-    # 300 weekly reference bars so the coarsest (1M) timeframe has enough warm-up bars
-    # for the lead-timeframe direction (EMA alignment) to resolve.
-    histories = {"AAA": _aligned("AAA", resolved.timeframes, resolved.reference_timeframe, 300)}
-    btc = _aligned("BTC/USDT", resolved.timeframes, resolved.reference_timeframe, 300)
+    # 900 weekly reference bars. The coarsest timeframe here is monthly, and the method's
+    # long-term filter is a 200-period simple average that is reported absent rather than
+    # back-filled — so the fixture needs ~200 months (900 weeks ≈ 210) before the lead
+    # timeframe can resolve a direction at all.
+    histories = {"AAA": _aligned("AAA", resolved.timeframes, resolved.reference_timeframe, 900)}
+    btc = _aligned("BTC/USDT", resolved.timeframes, resolved.reference_timeframe, 900)
 
     run = Backtester().run(config, histories, btc)
     assert len(run.outcomes) >= 1

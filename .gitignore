@@ -1,1 +1,30 @@
 .cache/*
+
+# Credentials. The app never reads secrets from a file — the OpenAI key and Telegram
+# token come from environment variables named in the config — but if you ever keep a
+# local file of `export` lines here, this makes it uncommittable.
+.env
+.env.*
+*.env
+secrets.yaml
+
+# Python bytecode. Never useful in the repository and noisy in every diff.
+__pycache__/
+*.py[cod]
+
+# Tooling and virtualenv caches.
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# macOS directory metadata.
+.DS_Store
+
+# Generated run output: backtest reports, scan results and the trade log. These are
+# reproducible from a config plus a window, so the numbers live in the docs that cite
+# them rather than as committed artifacts.
+report.json
+results.json
+trades.csv
+.claude/scheduled_tasks.lock

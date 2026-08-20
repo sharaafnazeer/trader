@@ -73,6 +73,76 @@ class BacktestReport:
     risk_per_trade: float
 
 
+# The metrics a comparison reports, and which direction counts as better. Trade count has
+# no inherent direction — more trades is neither good nor bad on its own — so it is compared
+# and displayed without a verdict rather than being scored misleadingly.
+HIGHER_IS_BETTER = "higher"
+LOWER_IS_BETTER = "lower"
+NEUTRAL = "neutral"
+
+COMPARED_METRICS: tuple[tuple[str, str], ...] = (
+    ("resolved_trades", NEUTRAL),
+    ("win_rate", HIGHER_IS_BETTER),
+    ("expectancy", HIGHER_IS_BETTER),
+    ("profit_factor", HIGHER_IS_BETTER),
+    ("max_drawdown", LOWER_IS_BETTER),
+)
+
+
+@dataclass(frozen=True)
+class MetricDelta:
+    """One metric's movement between a baseline run and the current run.
+
+    ``improved`` is ``True`` when the change is in the favourable direction, ``False`` when
+    it is against, and ``None`` both for an unchanged metric and for one with no inherent
+    direction. That three-way answer is the point: a table that scored trade count as
+    "better" because it went up would be quietly lying about what was measured.
+    """
+
+    name: str
+    baseline: float | None
+    current: float | None
+    delta: float | None
+    improved: bool | None
+
+
+def compare_summaries(
+    baseline: dict[str, object], current: dict[str, object]
+) -> tuple[MetricDelta, ...]:
+    """Compare two backtest report summaries, metric by metric.
+
+    Both arguments are the ``summary`` mapping of a serialized report, so this works
+    directly on what was loaded from a saved JSON file with no backtest run required.
+    A metric missing from either side, or non-numeric (``profit_factor`` is emitted as
+    ``null`` for an infinite factor), yields a delta of ``None`` rather than raising — an
+    incomparable metric should be reported as such, not crash a comparison of the rest.
+
+    Pure: reads both mappings and returns values.
+    """
+
+    def number(source: dict[str, object], key: str) -> float | None:
+        value = source.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+
+    deltas: list[MetricDelta] = []
+    for name, direction in COMPARED_METRICS:
+        before, after = number(baseline, name), number(current, name)
+        if before is None or after is None:
+            deltas.append(MetricDelta(name, before, after, None, None))
+            continue
+        change = after - before
+        if direction == NEUTRAL or change == 0.0:
+            improved: bool | None = None
+        elif direction == HIGHER_IS_BETTER:
+            improved = change > 0.0
+        else:
+            improved = change < 0.0
+        deltas.append(MetricDelta(name, before, after, change, improved))
+    return tuple(deltas)
+
+
 def _breakdown(key: str, resolved: list[TradeOutcome]) -> Breakdown:
     wins = sum(1 for o in resolved if o.result is TradeResult.WIN)
     losses = sum(1 for o in resolved if o.result is TradeResult.LOSS)

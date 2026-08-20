@@ -44,6 +44,13 @@ def test_candles_latest_close_is_last_row_close() -> None:
     assert isinstance(candles.latest_close, float)
 
 
+def test_candles_latest_open_time_is_last_row_timestamp() -> None:
+    candles = map_ohlcv("BTC/USDT", "4h", _canned_ohlcv())
+
+    assert candles.latest_open_time == 1_700_001_200_000
+    assert isinstance(candles.latest_open_time, int)
+
+
 def test_map_order_book_spread_is_best_ask_minus_best_bid() -> None:
     # ccxt fetch_order_book shape: bids/asks are [price, amount] levels, best first.
     canned = {

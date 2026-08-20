@@ -9,8 +9,10 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import os
 import sys
 import time
+from collections.abc import Sequence
 from dataclasses import replace
 
 import pandas as pd
@@ -18,19 +20,75 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from trader.analyst import (
+    Action,
+    Analyst,
+    AnalystError,
+    AnalystReview,
+    AnalystVerdict,
+    RejectedVerdict,
+    partition_verdicts,
+)
 from trader.backtester import BTC_CONTEXT_SYMBOL, Backtester, SkippedCoin
+from trader.brief import (
+    MarketBrief,
+    SetupBrief,
+    build_brief,
+    build_mover_brief,
+    render_briefs,
+)
 from trader.cache_refresher import CacheRefresher, RefreshSummary
+from trader.candidate_gate import (
+    CooldownState,
+    pair_candidates,
+    pair_movers,
+    record_selection,
+    select,
+)
 from trader.concurrent_loader import ConcurrentHistoryLoader
-from trader.config import Config, ConfigError, load_config, parse_iso_date
+from trader.config import (
+    DEFAULT_ENV_FILE,
+    Config,
+    ConfigError,
+    load_config,
+    load_env_file,
+    parse_iso_date,
+    resolve_ai_credential,
+    resolve_telegram_credentials,
+)
+from trader.decision_log import (
+    SCANNER_MOVERS,
+    SCANNER_SCAN,
+    DecisionLog,
+    DecisionRecord,
+    records_for_failure,
+    records_for_review,
+)
 from trader.direction import Direction
 from trader.historical_data import CcxtHistoricalDataProvider, HistoricalDataProvider
 from trader.indicators import compute_features
 from trader.market_data import Candles, CcxtBinanceProvider, MarketDataProvider
-from trader.metrics import BacktestReport, summarize
-from trader.movers import MarketDataBenchmark, MomentumCoin, MoversRun, run_movers
+from trader.metrics import BacktestReport, MetricDelta, compare_summaries, summarize
+from trader.momentum import trailing_breakout_level
+from trader.movers import (
+    DEFAULT_MOVERS_TIMEFRAME,
+    MarketDataBenchmark,
+    MomentumCoin,
+    MoversRun,
+    run_movers,
+)
+from trader.notify import (
+    Notifier,
+    NotifyError,
+    NullNotifier,
+    TelegramNotifier,
+    format_alert,
+    should_alert,
+)
+from trader.openai_analyst import OpenAIAnalyst, openai_completion_fn
 from trader.provider import AnalysisProvider, TradingViewProvider
 from trader.replay import timeframe_to_ms
-from trader.runner import DEFAULT_BTC_SYMBOL, AnalysisRun, Failure, Runner, SleepFn
+from trader.runner import DEFAULT_BTC_SYMBOL, AnalysisRun, CoinAnalysis, Failure, Runner, SleepFn
 from trader.trade_simulator import TradeOutcome
 
 # Default traded window for a live backtest when no range is given: the last 365 days.
@@ -95,6 +153,42 @@ _DIRECTION_STYLE: dict[Direction, tuple[str, str]] = {
 }
 
 
+# Rich falls back to 80 columns when stdout is not a terminal — which is exactly when the
+# output is being piped to a file, a log or a pager. Eighty is too narrow for the setups
+# table, and rich's response to a narrow column is to *ellipsize*: a stop-loss of
+# 0.00267387 prints as "0.00267…". A trade level that silently loses digits is worse than
+# no output at all, so a redirected run is given a width the table fits in. On a real
+# terminal the width is left alone, so it still adapts to the window.
+NON_TERMINAL_WIDTH = 140
+
+def add_numeric_column(table: Table, header: str) -> None:
+    """Add a numeric column that wraps rather than ellipsizes when space runs short.
+
+    Rich's default overflow is ``ellipsis``, which turns a stop-loss of 0.00267387 into
+    "0.00267…" in a narrow terminal. Folding costs a second line instead of the tail of the
+    number, which is the right trade for anything the trader acts on: a clipped *symbol* is
+    an annoyance, a clipped *level* is a wrong order.
+    """
+
+    table.add_column(header, justify="right", overflow="fold", no_wrap=False)
+
+
+def make_console() -> Console:
+    """The CLI's console: auto-width on a real terminal, a fitting width when redirected.
+
+    The test is ``isatty``, not rich's ``is_terminal``. Those disagree exactly where it
+    matters: with ``FORCE_COLOR`` set (common in CI and in some shells) rich reports a
+    terminal for a piped stdout and *still* falls back to 80 columns — so branching on
+    ``is_terminal`` would leave the redirected case broken in the environments most likely
+    to hit it. An explicit ``COLUMNS`` is honoured either way, because someone who set it
+    means it.
+    """
+
+    if sys.stdout.isatty() or os.environ.get("COLUMNS"):
+        return Console()
+    return Console(width=NON_TERMINAL_WIDTH)
+
+
 def _render_failures(failures: tuple[Failure, ...], console: Console) -> None:
     if not failures:
         return
@@ -146,18 +240,32 @@ def run_market_data(
     # indicator computation is observable end-to-end from the CLI.
     features = compute_features(candles)
     feature_table = Table(title=f"Technical features: {symbol} ({timeframe})")
-    feature_table.add_column("EMA 20", justify="right")
+    feature_table.add_column("EMA 10", justify="right")
+    feature_table.add_column("EMA 21", justify="right")
     feature_table.add_column("EMA 50", justify="right")
-    feature_table.add_column("EMA 200", justify="right")
-    feature_table.add_column("RSI", justify="right")
+    feature_table.add_column("SMA 200", justify="right")
     feature_table.add_row(
-        f"{features.ema20:g}",
+        f"{features.ema10:g}",
+        f"{features.ema21:g}",
         f"{features.ema50:g}",
-        f"{features.ema200:g}",
-        f"{features.rsi:g}",
+        f"{features.sma200:g}",
     )
     console.print(feature_table)
     return latest_close, spread
+
+
+def _setups_cell(analysis: CoinAnalysis) -> str:
+    """Every setup that matched this coin, not only the one deciding its row.
+
+    A coin can present a trend pullback and a breakout at once. Showing just the deciding
+    verdict would hide the second, and the second is often the more interesting fact — two
+    independent methods pointing at the same coin is not the same evidence as one.
+    """
+
+    matched = sorted(
+        v.strategy.value for v in analysis.verdicts if v.strategy is not None
+    )
+    return "+".join(matched) if matched else "—"
 
 
 def _render_setups(
@@ -166,100 +274,616 @@ def _render_setups(
     details: bool = False,
     show_all: bool = False,
 ) -> None:
-    """Render the scored coins as a table.
+    """Render the scan as the method's four-part answer per coin.
 
-    By default this is the threshold-filtered, score-ranked *short list* of surfaced
-    setups (a clear direction with a total at or above the quality threshold). With
-    ``show_all`` every analyzed coin is listed instead — including sub-threshold coins
-    and those with no direction — so the whole picture can be seen. Alongside each
-    row's direction and score the concrete trade plan (entry, stop-loss, take-profit,
-    and risk-to-reward) is shown; with ``details`` the per-category breakdown behind
-    the total is expanded into an extra column so the trader can see *why* it scored
-    the way it did. Plans and breakdowns are read from the same in-memory analyses.
+    Trend, setup, entry status and decision are separate columns because they are separate
+    facts: a coin can have a textbook trend and no entry, and collapsing that into one
+    verdict is the misread the whole catalogue exists to prevent. WAIT is expected to be the
+    common answer, so a scan with nothing ready says so in words rather than printing an
+    empty table and leaving the trader to wonder whether it ran.
+
+    By default only READY setups are listed. ``show_all`` lists every analysed coin —
+    including the waiting ones and those matching no setup — with the reason attached.
     """
-
-    plans_by_symbol = {analysis.symbol: analysis.plan for analysis in run.analyses}
-    reasons_by_symbol = {analysis.symbol: analysis.reason for analysis in run.analyses}
-    limited_by_symbol = {analysis.symbol: analysis.limited_history for analysis in run.analyses}
-
-    # The reason a coin was not surfaced is only meaningful in the full/detailed views;
-    # the default short list is surfaced coins only, so it carries no reason column.
-    show_reason = show_all or details
 
     if show_all:
         title = "All coins"
-        ordered = sorted(
+        # Closest to ready first, so the coins worth watching are at the top and the ones
+        # matching no setup fall to the bottom. ``run.setups`` is already ranked.
+        rows = sorted(
             run.analyses,
-            key=lambda a: a.score.total if a.score is not None else -1.0,
-            reverse=True,
-        )
-        rows = [
-            (
+            key=lambda a: (
+                -(a.verdict.conditions_met if a.verdict is not None else 0),
                 a.symbol,
-                a.direction,
-                a.score.total if a.score is not None else None,
-                a.score.categories if a.score is not None else None,
-            )
-            for a in ordered
-        ]
+            ),
+        )
     else:
-        title = "High-conviction setups"
-        rows = [
-            (score.symbol, score.direction, score.total, score.categories)
-            for score in run.setups
-        ]
+        title = "Setups — ready to trade"
+        rows = list(run.setups)
+
+    plans = {a.symbol: a.plan for a in run.analyses}
 
     table = Table(title=title)
-    table.add_column("Rank", justify="right")
+    table.add_column("#", justify="right")
     table.add_column("Symbol")
-    table.add_column("Direction")
-    table.add_column("Score/100", justify="right")
-    table.add_column("Entry", justify="right")
-    table.add_column("SL", justify="right")
-    table.add_column("TP", justify="right")
-    table.add_column("R:R", justify="right")
-    if show_reason:
-        table.add_column("Reason")
+    table.add_column("Trend")
+    table.add_column("Setup")
+    table.add_column("Entry")
+    table.add_column("Decision")
+    # The two views answer different questions and so carry different columns. The default
+    # view is a trade list and needs the levels. ``--all`` is diagnostic — *why is this coin
+    # not ready?* — where levels for a coin that is not a trade crowd out the reason, which
+    # is the only thing on the row worth reading.
+    if not show_all:
+        add_numeric_column(table, "Entry@")
+        add_numeric_column(table, "SL")
+        add_numeric_column(table, "TP")
+        add_numeric_column(table, "R:R")
+        table.add_column("Target", max_width=12, overflow="ellipsis")
+    if show_all or details:
+        # Reason is prose, so it clips rather than wrapping: over 86 coins the full text
+        # turns every row into a paragraph and the table stops being scannable. A minimum
+        # width keeps it useful — squeezed to ten characters it says nothing at all. The
+        # full text is never lost: it goes to the analyst's evidence verbatim.
+        table.add_column(
+            "Reason", min_width=40, max_width=70, no_wrap=True, overflow="ellipsis"
+        )
         table.add_column("History")
-    if details:
-        table.add_column("Breakdown")
 
-    for position, (symbol, direction, total, categories) in enumerate(rows, start=1):
-        style, label = _DIRECTION_STYLE[direction]
-        plan = plans_by_symbol.get(symbol)
+    for position, analysis in enumerate(rows, start=1):
+        verdict = analysis.verdict
+        # Style follows the direction the coin would actually be traded in: a breakout
+        # resolves its own, and may do so where the trend rule resolved nothing.
+        style, _label = _DIRECTION_STYLE[analysis.setup_direction]
+        plan = plans.get(analysis.symbol)
         if plan is not None:
-            entry, stop_loss, take_profit, risk_reward = (
+            levels = [
                 f"{plan.entry:g}",
                 f"{plan.stop_loss:g}",
                 f"{plan.take_profit:g}",
                 f"{plan.risk_reward:.2f}",
-            )
+                # The ratio alone says nothing: the planner floors every target at it. What
+                # distinguishes the setups is whether that target is a level the market has
+                # respected or one placed to satisfy the arithmetic.
+                "structural" if plan.target_is_structural else "manufactured",
+            ]
         else:
-            entry = stop_loss = take_profit = risk_reward = "—"
+            levels = ["—"] * 5
+
+        decision = (
+            _DIRECTION_STYLE[verdict.decision][1]
+            if verdict is not None and verdict.decision is not Direction.NONE
+            else "WAIT"
+        )
         cells = [
             str(position),
-            symbol,
-            label,
-            f"{total:.1f}" if total is not None else "—",
-            entry,
-            stop_loss,
-            take_profit,
-            risk_reward,
-        ]
-        if show_reason:
-            reason = reasons_by_symbol.get(symbol)
-            cells.append(reason if reason else "—")
-            cells.append("limited" if limited_by_symbol.get(symbol) else "—")
-        if details:
-            breakdown = (
-                "  ".join(f"{c.name}={c.points:.1f}" for c in categories)
-                if categories
-                else "—"
+            analysis.symbol,
+            verdict.trend.value if verdict is not None else analysis.direction.value,
+            _setups_cell(analysis),
+            (
+                f"{verdict.entry_status.value} "
+                f"({verdict.conditions_met}/{verdict.conditions_evaluated})"
             )
-            cells.append(breakdown)
+            if verdict is not None
+            else "—",
+            decision,
+            *(levels if not show_all else []),
+        ]
+        if show_all or details:
+            # The checklist explains a WAIT; the direction rule explains why a coin never
+            # reached the checklist at all ("btc_veto", "lead_unresolved"). Both are reasons
+            # the coin is not a trade, and dropping either leaves a silent row.
+            reason = verdict.reason if verdict is not None else (analysis.reason or "—")
+            cells.append(reason)
+            cells.append("limited" if analysis.limited_history else "—")
         table.add_row(*cells, style=style or None)
 
     console.print(table)
+
+    if not rows and not show_all:
+        # Silence is a result, and saying so is the difference between "the method found
+        # nothing today" and "something went wrong". Never dress a WAIT list as a trade list.
+        waiting = sum(
+            1 for a in run.analyses if a.verdict is not None and a.verdict.strategy is not None
+        )
+        console.print(
+            f"[yellow]Nothing is ready to trade.[/yellow] "
+            f"{waiting} coin(s) match a setup but are waiting on an entry; "
+            f"re-run with --all to see what each is waiting for."
+        )
+
+
+def _describe_trendline(analysis: CoinAnalysis) -> str:
+    """The fitted trendline as one readable phrase for the analyst's evidence."""
+
+    line = analysis.trendline
+    assert line is not None  # guarded by the caller
+    shape = "rising" if line.is_rising else ("falling" if line.is_falling else "flat")
+    return (
+        f"{shape} at {line.level_now:.6g} "
+        f"({line.touches} touches, fit {line.r_squared:.2f})"
+    )
+
+
+def build_scan_briefs(
+    run: AnalysisRun, config: Config, cooldown: CooldownState | None = None
+) -> tuple[SetupBrief, ...]:
+    """Select the run's reviewable candidates and build their evidence packs.
+
+    Every scored, directional coin is joined to its per-coin analysis, filtered by the
+    configured score floor, dropped if already reviewed on the current reference candle,
+    capped, then projected into briefs. The pool is the run's surfaced coins — those that
+    resolved a direction and produced a usable plan — see
+    :func:`~trader.candidate_gate.pair_candidates`. When a ``cooldown`` is supplied the
+    selection is recorded into it, so a repeating watch loop that passes the same instance
+    every iteration selects a given setup once per reference candle rather than once per
+    poll.
+    """
+
+    selected = select(
+        pair_candidates(
+            run,
+            long_only=config.long_only,
+            review_within=config.strategies.review_within if config.strategies.enabled else None,
+        ),
+        # The 0-100 floor applies to the momentum scanner, which still has a score. The trend
+        # engine's floor is ``strategies.review_within``, applied above in checklist terms.
+        min_score=None,
+        max_candidates=config.ai.max_candidates,
+        cooldown=cooldown,
+        reference_timeframe=config.reference_timeframe,
+        reserve_per_direction=config.ai.reserve_per_direction,
+    )
+    if cooldown is not None:
+        record_selection(cooldown, selected, config.reference_timeframe)
+    return tuple(
+        build_brief(
+            candidate.symbol,
+            candidate.direction,
+            features_by_tf=candidate.analysis.features_by_tf,
+            structure_by_tf=candidate.analysis.structure_by_tf,
+            close_by_tf={
+                tf: candles.latest_close
+                for tf, candles in candidate.analysis.candles_by_tf.items()
+            },
+            order_book=candidate.analysis.order_book,
+            plan=candidate.analysis.plan,
+            limited_history=candidate.analysis.limited_history,
+            timeframes=config.timeframes,
+            verdict=candidate.analysis.verdict,
+            verdicts=candidate.analysis.verdicts,
+            patterns_by_tf={config.reference_timeframe: candidate.analysis.reaction_patterns},
+            recent_candles=candidate.analysis.candles_by_tf.get(config.reference_timeframe),
+            candle_count=(
+                config.strategies.evidence_candles
+                if config.strategies.enabled or config.breakout.enabled
+                else 0
+            ),
+            trendline_by_tf=(
+                {config.reference_timeframe: _describe_trendline(candidate.analysis)}
+                if candidate.analysis.trendline is not None
+                else None
+            ),
+        )
+        for candidate in selected
+    )
+
+
+def _render_ai_dry_run(
+    run: AnalysisRun,
+    config: Config,
+    console: Console,
+    cooldown: CooldownState | None = None,
+) -> None:
+    """Print the evidence the AI analyst would be sent, without contacting a model.
+
+    This is the "show me what this would cost and what it would say" switch: it exercises
+    the real selection and evidence path and prints the result verbatim. When the stage is
+    disabled in configuration there is nothing to preview, and saying so plainly beats
+    printing an empty block.
+    """
+
+    if not config.ai.enabled:
+        console.print(
+            "[yellow]AI analyst is disabled (set `ai.enabled: true` to preview its "
+            "evidence).[/yellow]"
+        )
+        return
+
+    briefs = build_scan_briefs(run, config, cooldown)
+    console.print(
+        f"\n[bold]AI analyst evidence (dry run — no request made)[/bold]\n"
+        # No score floor is quoted: the trend engine has no 0-100 total to floor since its
+        # quality score was retired, so advertising one would describe a filter that is not
+        # running. ``ai.min_score`` still applies to the momentum scanner.
+        f"[dim]at most {config.ai.max_candidates} candidate(s) per run, "
+        f"one review per {config.reference_timeframe} candle[/dim]"
+    )
+    # Printed with markup and highlighting off: the evidence is verbatim what a model
+    # would receive, and its "[1] SYMBOL" candidate headers would otherwise be parsed as
+    # rich markup tags.
+    console.print(
+        render_briefs(briefs, MarketBrief(btc_direction=run.btc_direction)),
+        markup=False,
+        highlight=False,
+    )
+
+
+# How each analyst action is coloured and labelled in the verdict table.
+_ACTION_STYLE: dict[Action, tuple[str, str]] = {
+    Action.LONG: ("green", "▲ LONG"),
+    Action.SHORT: ("red", "▼ SHORT"),
+    Action.WAIT: ("yellow", "… WAIT"),
+    Action.AVOID: ("dim", "✕ AVOID"),
+}
+
+# Shown with every set of AI verdicts. The stage cannot place orders and never will in
+# this version; saying so on every render is cheaper than one misunderstanding.
+_AI_DISCLAIMER = (
+    "Advisory only — these are a language model's opinions on the engine's own "
+    "shortlist. No order has been placed and none can be. Verify before risking money."
+)
+
+
+def _levels(verdict: AnalystVerdict) -> tuple[str, str, str]:
+    """Entry / stop / targets as display strings; empty dashes for a stand-aside verdict."""
+
+    if not verdict.is_actionable:
+        return "—", "—", "—"
+    entry = f"{verdict.entry:g}" if verdict.entry is not None else "—"
+    stop = f"{verdict.stop_loss:g}" if verdict.stop_loss is not None else "—"
+    targets = " / ".join(f"{target:g}" for target in verdict.take_profits) or "—"
+    return entry, stop, targets
+
+
+def _render_verdicts(
+    accepted: Sequence[AnalystVerdict],
+    rejected: Sequence[RejectedVerdict],
+    review: AnalystReview,
+    console: Console,
+    run: AnalysisRun | None = None,
+) -> None:
+    """Render the analyst's opinions beside what the engine thought.
+
+    Disagreements are marked explicitly rather than quietly resolved: when the model says
+    short and the engine said long, the trader needs to see the conflict, not an
+    averaged-out answer. Rejected verdicts are listed separately with the reason they were
+    not shown as tradeable — never as a plan.
+
+    ``run`` supplies the engine's own checklist verdict so the two readings sit side by
+    side. Neither overrides the other: a mechanical checklist can tick every box in a
+    context that is obviously wrong, and it can be one condition short of a setup the model
+    can see completing. Showing both is also the only way to learn, later, which is worth
+    listening to.
+    """
+
+    # Only the scannable columns go in the table. Rationale and invalidation are prose and
+    # were being crushed into ~8-character columns, which made the whole table unreadable —
+    # they are printed underneath each verdict instead, where they have the full width.
+    table = Table(title="AI analyst verdicts")
+    table.add_column("Symbol")
+    table.add_column("Action")
+    table.add_column("Conf", justify="right")
+    table.add_column("Entry", justify="right")
+    table.add_column("SL", justify="right")
+    table.add_column("TP", justify="right")
+    table.add_column("Engine")
+    table.add_column("Analyst")
+    table.add_column("vs engine")
+
+    verdicts_by_symbol = (
+        {a.symbol: a.verdict for a in run.analyses if a.verdict is not None}
+        if run is not None
+        else {}
+    )
+
+    # Ordered by the analyst's confidence: it is the only figure that ranks the *actionable*
+    # list, and without it the table would arrive in whatever order the model replied.
+    for verdict in sorted(accepted, key=lambda v: (-v.confidence, v.symbol)):
+        style, label = _ACTION_STYLE[verdict.action]
+        entry, stop, targets = _levels(verdict)
+        engine = verdicts_by_symbol.get(verdict.symbol)
+        engine_read = (
+            f"{engine.strategy.value if engine.strategy else 'none'} "
+            f"{engine.entry_status.value} ({engine.conditions_met}/"
+            f"{engine.conditions_evaluated})"
+            if engine is not None
+            else "—"
+        )
+        analyst_read = f"{verdict.strategy} {verdict.entry_status}"
+        # Two ways to disagree, and they are different: about the trade, and about the read.
+        conflicts = [] if verdict.agrees_with_engine else ["direction"]
+        if engine is not None and verdict.entry_status != engine.entry_status.value:
+            conflicts.append("entry")
+        if engine is not None and engine.strategy is not None:
+            if verdict.strategy != engine.strategy.value:
+                conflicts.append("setup")
+        table.add_row(
+            verdict.symbol,
+            label,
+            f"{verdict.confidence:.0f}",
+            entry,
+            stop,
+            targets,
+            engine_read,
+            analyst_read,
+            "DISAGREES: " + ", ".join(conflicts) if conflicts else "—",
+            style=style or None,
+        )
+
+    console.print(table)
+
+    for verdict in accepted:
+        console.print(f"\n[bold]{verdict.symbol}[/bold] — {verdict.rationale}", highlight=False)
+        if verdict.invalidation:
+            console.print(f"  [dim]invalid if:[/dim] {verdict.invalidation}", highlight=False)
+        if verdict.key_risks:
+            console.print(
+                f"  [dim]risks:[/dim] {'; '.join(verdict.key_risks)}", highlight=False
+            )
+
+    if review.concentration_warning:
+        console.print(
+            f"\n[bold yellow]Concentration warning:[/bold yellow] "
+            f"{review.concentration_warning}",
+            highlight=False,
+        )
+
+    if rejected:
+        console.print("\n[bold red]Rejected verdicts (not tradeable):[/bold red]")
+        for item in rejected:
+            console.print(
+                f"  [red]{item.verdict.symbol}[/red] "
+                f"{item.verdict.action.value.upper()} — {item.reason}",
+                highlight=False,
+            )
+
+    cost = (
+        f"${review.estimated_cost_usd:.4f}"
+        if review.estimated_cost_usd is not None
+        else "not configured (set ai.input_cost_per_mtok / ai.output_cost_per_mtok)"
+    )
+    console.print(
+        f"[dim]model {review.model} · {review.prompt_tokens} prompt + "
+        f"{review.completion_tokens} completion tokens · estimated cost {cost}[/dim]",
+        highlight=False,
+    )
+    console.print(f"[dim]{_AI_DISCLAIMER}[/dim]")
+
+
+def _load_credentials_file(env_file: str, console: Console) -> None:
+    """Fill missing credentials from an environment file, reporting what it supplied.
+
+    Called before any credential is resolved. This is what makes a scheduled run work:
+    ``cron`` and ``launchd`` start with no login shell, so a key exported from a shell
+    profile is simply absent there, while a file in the working directory is not.
+
+    Only the *names* it set are printed, never the values.
+    """
+
+    loaded = load_env_file(env_file)
+    if loaded:
+        console.print(
+            f"[dim]Loaded {', '.join(sorted(loaded))} from {env_file}[/dim]",
+            highlight=False,
+        )
+
+
+def _build_notifier(config: Config) -> Notifier:
+    """Construct the configured notifier, reading its credentials from the environment.
+
+    Raises :class:`~trader.config.ConfigError` naming whichever variable is missing, so
+    the caller can exit before fetching anything. Alerting disabled yields a notifier that
+    delivers nothing, which keeps the calling code branch-free.
+    """
+
+    if not config.telegram.enabled:
+        return NullNotifier()
+    bot_token, chat_id = resolve_telegram_credentials(config.telegram)
+    return TelegramNotifier(bot_token, chat_id)
+
+
+def _build_analyst(config: Config) -> Analyst:
+    """Construct the configured analyst, reading its credential from the environment.
+
+    Raises :class:`~trader.config.ConfigError` when the credential is missing, so the
+    caller can exit before fetching anything. Only OpenAI is implemented; an unsupported
+    provider is already rejected at configuration load.
+    """
+
+    api_key = resolve_ai_credential(config.ai)
+    return OpenAIAnalyst(
+        openai_completion_fn(api_key),
+        model=config.ai.model,
+        temperature=config.ai.temperature,
+        max_retries=config.ai.max_retries,
+        input_cost_per_mtok=config.ai.input_cost_per_mtok,
+        output_cost_per_mtok=config.ai.output_cost_per_mtok,
+    )
+
+
+def _send_alerts(
+    notifier: Notifier | None,
+    accepted: Sequence[AnalystVerdict],
+    briefs: Sequence[SetupBrief],
+    review: AnalystReview,
+    config: Config,
+    console: Console,
+    scanner: str = SCANNER_SCAN,
+) -> int:
+    """Push every alert-worthy verdict, returning how many were sent.
+
+    A delivery failure is reported and the loop continues: one unreachable send must not
+    swallow the remaining alerts, and none of it may abort the run. Only actionable
+    verdicts at or above the confidence floor are sent — see
+    :func:`~trader.notify.should_alert`.
+    """
+
+    if notifier is None:
+        return 0
+
+    briefs_by_symbol = {brief.symbol: brief for brief in briefs}
+    sent = 0
+    for verdict in accepted:
+        if not should_alert(verdict, config.telegram.min_confidence):
+            continue
+        brief = briefs_by_symbol.get(verdict.symbol)
+        if brief is None:
+            continue
+        text = format_alert(
+            verdict,
+            brief,
+            concentration_warning=review.concentration_warning,
+            scanner=scanner,
+        )
+        try:
+            notifier.send(text)
+        except NotifyError as exc:
+            console.print(
+                f"[yellow]Could not alert for {verdict.symbol}: {exc}[/yellow]",
+                highlight=False,
+            )
+            continue
+        sent += 1
+
+    if sent:
+        console.print(f"[dim]Sent {sent} alert(s).[/dim]", highlight=False)
+    return sent
+
+
+def _review_candidates(
+    briefs: Sequence[SetupBrief],
+    market: MarketBrief,
+    config: Config,
+    console: Console,
+    analyst: Analyst,
+    *,
+    scanner: str,
+    decision_log: DecisionLog | None = None,
+    notifier: Notifier | None = None,
+    run: AnalysisRun | None = None,
+) -> tuple[AnalystReview, tuple[AnalystVerdict, ...], tuple[RejectedVerdict, ...]] | None:
+    """Review, validate, record, render and alert. ``None`` when nothing was reviewed.
+
+    Shared by both scanners — only the evidence and the ``scanner`` label differ, and
+    running them through one path is what keeps their behaviour (and their measurability)
+    identical.
+
+    Every failure here is contained: the engine's own table has already been printed and
+    is the thing the trader paid to compute, so an analyst outage is reported and the run
+    still succeeds. This is the only place that policy lives.
+
+    A failed review still writes one record per selected candidate. A gap in the log would
+    quietly bias any later measurement toward the runs that happened to work, so "we asked
+    and got nothing" has to be as visible in the history as a verdict is.
+    """
+
+    if not briefs:
+        return None
+
+    try:
+        review = analyst.review(briefs, market)
+    except AnalystError as exc:
+        console.print(f"[yellow]AI analyst unavailable: {exc}[/yellow]", highlight=False)
+        _record_decisions(
+            decision_log,
+            records_for_failure(scanner, briefs, str(exc), config.ai.model),
+            console,
+        )
+        return None
+
+    accepted, rejected = partition_verdicts(review, briefs)
+    _render_verdicts(accepted, rejected, review, console, run=run)
+    # Recorded before alerting: the measurement history is the durable artefact, and it
+    # should survive even if the phone never gets the message.
+    _record_decisions(
+        decision_log,
+        records_for_review(scanner, briefs, review, accepted, rejected),
+        console,
+    )
+    _send_alerts(notifier, accepted, briefs, review, config, console, scanner)
+    return review, accepted, rejected
+
+
+def _run_ai_review(
+    run: AnalysisRun,
+    config: Config,
+    console: Console,
+    analyst: Analyst,
+    cooldown: CooldownState | None = None,
+    decision_log: DecisionLog | None = None,
+    notifier: Notifier | None = None,
+) -> tuple[AnalystReview, tuple[AnalystVerdict, ...], tuple[RejectedVerdict, ...]] | None:
+    """Select the trend scan's candidates and put them through the shared review path."""
+
+    return _review_candidates(
+        build_scan_briefs(run, config, cooldown),
+        MarketBrief(btc_direction=run.btc_direction),
+        config,
+        console,
+        analyst,
+        scanner=SCANNER_SCAN,
+        decision_log=decision_log,
+        notifier=notifier,
+        run=run,
+    )
+
+
+def _record_decisions(
+    decision_log: DecisionLog | None,
+    records: Sequence[DecisionRecord],
+    console: Console,
+) -> None:
+    """Append records to the decision log, reporting but never re-raising a write error.
+
+    A full disk must not cost the trader a scan they already paid for; it is reported so
+    the gap in the measurement history is at least visible at the time it happens.
+    """
+
+    if decision_log is None or not records:
+        return
+    try:
+        decision_log.append_all(records)
+    except OSError as exc:
+        console.print(
+            f"[yellow]Could not write the decision log ({decision_log.path}): {exc}[/yellow]",
+            highlight=False,
+        )
+
+
+def review_to_dict(
+    review: AnalystReview,
+    accepted: Sequence[AnalystVerdict],
+    rejected: Sequence[RejectedVerdict],
+) -> dict[str, object]:
+    """Serialize a review into a JSON-ready dict mirroring the rendered table."""
+
+    def verdict_dict(verdict: AnalystVerdict) -> dict[str, object]:
+        return {
+            "symbol": verdict.symbol,
+            "action": verdict.action.value,
+            "confidence": verdict.confidence,
+            "entry": verdict.entry,
+            "stop_loss": verdict.stop_loss,
+            "take_profits": list(verdict.take_profits),
+            "invalidation": verdict.invalidation,
+            "rationale": verdict.rationale,
+            "key_risks": list(verdict.key_risks),
+            "agrees_with_engine": verdict.agrees_with_engine,
+        }
+
+    return {
+        "model": review.model,
+        "prompt_tokens": review.prompt_tokens,
+        "completion_tokens": review.completion_tokens,
+        "estimated_cost_usd": review.estimated_cost_usd,
+        "concentration_warning": review.concentration_warning,
+        "verdicts": [verdict_dict(verdict) for verdict in accepted],
+        "rejected": [
+            {"verdict": verdict_dict(item.verdict), "reason": item.reason}
+            for item in rejected
+        ],
+    }
 
 
 def analysis_run_to_dict(run: AnalysisRun) -> dict[str, object]:
@@ -285,6 +909,9 @@ def analysis_run_to_dict(run: AnalysisRun) -> dict[str, object]:
             "take_profit": plan.take_profit,
             "risk_reward": plan.risk_reward,
             "invalidation": plan.invalidation,
+            # Whether the target is a swing level or one placed to satisfy the ratio. The
+            # ratio itself is floored, so it is this flag that carries the information.
+            "target_is_structural": plan.target_is_structural,
         }
 
     return {
@@ -295,16 +922,6 @@ def analysis_run_to_dict(run: AnalysisRun) -> dict[str, object]:
                 "surfaced": a.symbol in surfaced,
                 "reason": a.reason,
                 "limited_history": a.limited_history,
-                "total": a.score.total if a.score is not None else None,
-                "categories": [
-                    {
-                        "name": c.name,
-                        "fraction": c.fraction,
-                        "weight": c.weight,
-                        "points": c.points,
-                    }
-                    for c in (a.score.categories if a.score is not None else ())
-                ],
                 "trade_plan": plan_dict(a.symbol),
             }
             for a in run.analyses
@@ -326,6 +943,11 @@ def run_scan(
     details: bool = False,
     show_all: bool = False,
     json_path: str | None = None,
+    dry_run_ai: bool = False,
+    cooldown: CooldownState | None = None,
+    analyst: Analyst | None = None,
+    decision_log: DecisionLog | None = None,
+    notifier: Notifier | None = None,
 ) -> AnalysisRun:
     """Run the v2 pipeline over the watchlist and render the results.
 
@@ -336,6 +958,14 @@ def run_scan(
     per-category breakdown. When ``json_path`` is given, a structured record derived
     from the same in-memory result as the table is written there. Coins whose market
     data cannot be fetched are skipped and summarized rather than aborting the run.
+    With ``dry_run_ai`` the evidence the AI analyst would be sent is printed after the
+    table; no model is contacted and nothing is spent. ``cooldown`` carries the
+    already-reviewed setups across calls so a repeating caller does not re-select the
+    same setup on every poll; a single call may leave it ``None``. ``analyst`` is
+    injected so tests can substitute a fake; omitting it disables the stage entirely.
+    ``decision_log`` receives one record per reviewed candidate; omitting it records
+    nothing. ``notifier`` receives one alert per high-confidence actionable verdict;
+    omitting it sends nothing.
     """
 
     result = Runner(sleep=sleep).run_analysis(
@@ -348,11 +978,6 @@ def run_scan(
         ohlcv_limit=config.ohlcv_lookback,
         exchange=config.exchange,
         screener=config.screener,
-        category_weights=config.category_weights,
-        quality_threshold=config.quality_threshold,
-        relative_volume_multiple=config.relative_volume_multiple,
-        min_depth=config.min_depth,
-        max_spread=config.max_spread,
         atr_buffer=config.atr_buffer,
         target_rr=config.target_rr,
         reference_timeframe=config.reference_timeframe,
@@ -361,12 +986,32 @@ def run_scan(
         htf_timeframes=tuple(config.htf_timeframes),
         require_confirmation=config.require_confirmation,
         btc_veto=config.btc_veto,
+        strategies=config.strategies,
+        breakout=config.breakout,
     )
     _render_setups(result, console, details=details, show_all=show_all)
     _render_failures(result.failures, console)
+    # The dry run and the real review are mutually exclusive: the whole point of the dry
+    # run is that it spends nothing.
+    # No analyst supplied means nothing to review — the stage stays silent rather than
+    # printing an empty verdict table.
+    review_payload: dict[str, object] | None = None
+    if dry_run_ai:
+        _render_ai_dry_run(result, config, console, cooldown)
+    elif config.ai.enabled and analyst is not None:
+        outcome = _run_ai_review(
+            result, config, console, analyst, cooldown, decision_log, notifier
+        )
+        if outcome is not None:
+            review, accepted, rejected = outcome
+            review_payload = review_to_dict(review, accepted, rejected)
+
     if json_path is not None:
+        payload = analysis_run_to_dict(result)
+        if review_payload is not None:
+            payload["review"] = review_payload
         with open(json_path, "w", encoding="utf-8") as handle:
-            json.dump(analysis_run_to_dict(result), handle, indent=2)
+            json.dump(payload, handle, indent=2)
     return result
 
 
@@ -379,6 +1024,10 @@ def run_scan_forever(
     details: bool = False,
     show_all: bool = False,
     json_path: str | None = None,
+    dry_run_ai: bool = False,
+    analyst: Analyst | None = None,
+    decision_log: DecisionLog | None = None,
+    notifier: Notifier | None = None,
     sleep: SleepFn = time.sleep,
     max_iterations: int | None = None,
 ) -> int:
@@ -386,8 +1035,14 @@ def run_scan_forever(
 
     Loops forever by default; ``max_iterations`` bounds it so tests can assert the loop
     behavior without wall-clock timing. Returns the number of runs performed.
+
+    The loop owns one :class:`~trader.candidate_gate.CooldownState` for its whole life and
+    passes it into every iteration. That single shared instance is what makes the AI
+    analyst affordable to leave running: a setup is selected once per reference candle, not
+    once per poll, so shortening the poll interval costs nothing extra.
     """
 
+    cooldown = CooldownState()
     iterations = 0
     while max_iterations is None or iterations < max_iterations:
         run_scan(
@@ -399,6 +1054,11 @@ def run_scan_forever(
             details=details,
             show_all=show_all,
             json_path=json_path,
+            dry_run_ai=dry_run_ai,
+            cooldown=cooldown,
+            analyst=analyst,
+            decision_log=decision_log,
+            notifier=notifier,
         )
         iterations += 1
         if max_iterations is not None and iterations >= max_iterations:
@@ -434,21 +1094,56 @@ def scan(
         "--watch",
         help="Re-run the analysis every INTERVAL seconds until interrupted.",
     ),
+    ai: bool | None = typer.Option(
+        None,
+        "--ai/--no-ai",
+        help=(
+            "Enable or disable the AI analyst for this run, overriding `ai.enabled` in "
+            "the configuration. Enabling it makes a paid request per run."
+        ),
+    ),
+    env_file: str = typer.Option(
+        DEFAULT_ENV_FILE,
+        "--env-file",
+        help=(
+            "File of KEY=VALUE credential lines to fill any unset environment variables "
+            "from. Anything already exported wins. Missing file is fine."
+        ),
+    ),
+    dry_run_ai: bool = typer.Option(
+        False,
+        "--dry-run-ai",
+        help=(
+            "Print the evidence the AI analyst would be sent for this run's selected "
+            "candidates. Contacts no model and spends nothing."
+        ),
+    ),
     verbose: int = typer.Option(0, "--verbose", "-v", count=True, help=_VERBOSE_HELP),
     log_file: str | None = typer.Option(None, "--log-file", help=_LOG_FILE_HELP),
 ) -> None:
     """Score each watchlist coin from live Binance + TradingView and surface setups."""
 
     configure_logging(verbose, log_file)
+    console = make_console()
+    # The credential check runs inside this block, after the --ai/--no-ai override has
+    # resolved and *before* any market data is fetched: a missing key should cost the
+    # trader a second, not a full scan.
     try:
         config = load_config(config_path)
+        if ai is not None:
+            config = replace(config, ai=replace(config.ai, enabled=ai))
+        reviewing = config.ai.enabled and not dry_run_ai
+        if reviewing:
+            _load_credentials_file(env_file, console)
+        analyst = _build_analyst(config) if reviewing else None
+        decision_log = DecisionLog(config.ai.decision_log) if reviewing else None
+        notifier = _build_notifier(config) if reviewing else None
     except ConfigError as exc:
         typer.secho(f"Configuration error: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
 
     market_data_provider = CcxtBinanceProvider()
     analysis_provider = TradingViewProvider(batch_size=config.tradingview_batch_size)
-    console = Console()
     interval = watch if watch is not None else config.watch_interval
     if interval is not None:
         run_scan_forever(
@@ -460,6 +1155,10 @@ def scan(
             details=details,
             show_all=show_all,
             json_path=json_path,
+            dry_run_ai=dry_run_ai,
+            analyst=analyst,
+            decision_log=decision_log,
+            notifier=notifier,
         )
     else:
         run_scan(
@@ -470,6 +1169,10 @@ def scan(
             details=details,
             show_all=show_all,
             json_path=json_path,
+            dry_run_ai=dry_run_ai,
+            analyst=analyst,
+            decision_log=decision_log,
+            notifier=notifier,
         )
 
 
@@ -514,14 +1217,14 @@ def _render_movers(run: MoversRun, console: Console, show_all: bool = False) -> 
         rows = [(s.symbol, s.direction, s.score, None) for s in run.movers]
 
     table = Table(title=title)
-    table.add_column("Rank", justify="right")
+    table.add_column("#", justify="right")
     table.add_column("Symbol")
-    table.add_column("Direction")
-    table.add_column("Score/100", justify="right")
-    table.add_column("Entry", justify="right")
-    table.add_column("SL", justify="right")
-    table.add_column("TP", justify="right")
-    table.add_column("R:R", justify="right")
+    table.add_column("Dir")
+    add_numeric_column(table, "Score")
+    add_numeric_column(table, "Entry")
+    add_numeric_column(table, "SL")
+    add_numeric_column(table, "TP")
+    add_numeric_column(table, "R:R")
     if show_all:
         table.add_column("Status")
 
@@ -612,6 +1315,82 @@ def movers_run_to_dict(run: MoversRun) -> dict[str, object]:
     }
 
 
+def build_movers_briefs(
+    run: MoversRun, config: Config, cooldown: CooldownState | None = None
+) -> tuple[SetupBrief, ...]:
+    """Select the momentum run's reviewable movers and build their evidence packs.
+
+    Only surfaced movers are eligible, and the same score floor, per-run cap and
+    per-candle cooldown apply as on the trend path — the floor now measured against the
+    composite momentum score rather than the trend engine's quality score.
+    """
+
+    selected = select(
+        pair_movers(run),
+        min_score=config.ai.min_score,
+        max_candidates=config.ai.max_candidates,
+        cooldown=cooldown,
+        reference_timeframe=DEFAULT_MOVERS_TIMEFRAME,
+        reserve_per_direction=config.ai.reserve_per_direction,
+    )
+    if cooldown is not None:
+        record_selection(cooldown, selected, DEFAULT_MOVERS_TIMEFRAME)
+    return tuple(
+        build_mover_brief(
+            candidate.score,
+            candles=candidate.coin.candles,
+            order_book=candidate.coin.order_book,
+            plan=candidate.coin.plan,
+            breakout_level=trailing_breakout_level(
+                candidate.coin.candles,
+                config.breakout_lookback_days,
+                candidate.score.direction,
+            ),
+        )
+        for candidate in selected
+    )
+
+
+def _movers_market_brief(run: MoversRun) -> MarketBrief:
+    """Market context for a momentum run: the benchmark its scores were measured against."""
+
+    return MarketBrief(btc_return_pct=run.btc_return * 100.0)
+
+
+def _render_movers_ai_dry_run(
+    run: MoversRun,
+    config: Config,
+    console: Console,
+    cooldown: CooldownState | None = None,
+) -> None:
+    """Print the evidence the analyst would be sent for this momentum run."""
+
+    if not config.ai.enabled:
+        console.print(
+            "[yellow]AI analyst is disabled (set `ai.enabled: true` to preview its "
+            "evidence).[/yellow]"
+        )
+        return
+
+    briefs = build_movers_briefs(run, config, cooldown)
+    console.print(
+        f"\n[bold]AI analyst evidence (dry run — no request made)[/bold]\n"
+        f"[dim]momentum floor {config.ai.min_score:g}, at most "
+        f"{config.ai.max_candidates} candidate(s) per run, one review per "
+        f"{DEFAULT_MOVERS_TIMEFRAME} candle[/dim]"
+    )
+    console.print(
+        render_briefs(
+            briefs,
+            _movers_market_brief(run),
+            scanner=SCANNER_MOVERS,
+            breakdown_label="factors",
+        ),
+        markup=False,
+        highlight=False,
+    )
+
+
 def run_movers_cli(
     market_data_provider: MarketDataProvider,
     console: Console,
@@ -620,6 +1399,11 @@ def run_movers_cli(
     *,
     show_all: bool = False,
     json_path: str | None = None,
+    dry_run_ai: bool = False,
+    cooldown: CooldownState | None = None,
+    analyst: Analyst | None = None,
+    decision_log: DecisionLog | None = None,
+    notifier: Notifier | None = None,
 ) -> MoversRun:
     """Run the momentum scanner over the watchlist and render the ranked movers.
 
@@ -628,6 +1412,11 @@ def run_movers_cli(
     The BTC benchmark is derived from the same provider (fetched once per run).
     ``show_all`` widens the table to every evaluated coin; when ``json_path`` is given a
     structured record derived from the same in-memory result is written there.
+
+    The AI-analyst collaborators mirror the trend path exactly: ``dry_run_ai`` previews
+    the evidence without contacting a model, and ``analyst`` / ``decision_log`` /
+    ``notifier`` / ``cooldown`` are injected so the whole stage is testable without a
+    network. Omitting any of them disables that part of the stage.
     """
 
     benchmark = MarketDataBenchmark(market_data_provider)
@@ -650,9 +1439,31 @@ def run_movers_cli(
     )
     _render_movers(run, console, show_all=show_all)
     _render_failures(run.failures, console)
+
+    review_payload: dict[str, object] | None = None
+    if dry_run_ai:
+        _render_movers_ai_dry_run(run, config, console, cooldown)
+    elif config.ai.enabled and analyst is not None:
+        outcome = _review_candidates(
+            build_movers_briefs(run, config, cooldown),
+            _movers_market_brief(run),
+            config,
+            console,
+            analyst,
+            scanner=SCANNER_MOVERS,
+            decision_log=decision_log,
+            notifier=notifier,
+        )
+        if outcome is not None:
+            review, accepted, rejected = outcome
+            review_payload = review_to_dict(review, accepted, rejected)
+
     if json_path is not None:
+        payload = movers_run_to_dict(run)
+        if review_payload is not None:
+            payload["review"] = review_payload
         with open(json_path, "w", encoding="utf-8") as handle:
-            json.dump(movers_run_to_dict(run), handle, indent=2)
+            json.dump(payload, handle, indent=2)
         console.print(f"Wrote movers report to {json_path}")
     return run
 
@@ -674,22 +1485,64 @@ def movers(
         "--json",
         help="Write the full movers report (scores + trade plans) to this JSON file.",
     ),
+    ai: bool | None = typer.Option(
+        None,
+        "--ai/--no-ai",
+        help=(
+            "Enable or disable the AI analyst for this run, overriding `ai.enabled` in "
+            "the configuration. Enabling it makes a paid request per run."
+        ),
+    ),
+    env_file: str = typer.Option(
+        DEFAULT_ENV_FILE,
+        "--env-file",
+        help=(
+            "File of KEY=VALUE credential lines to fill any unset environment variables "
+            "from. Anything already exported wins. Missing file is fine."
+        ),
+    ),
+    dry_run_ai: bool = typer.Option(
+        False,
+        "--dry-run-ai",
+        help=(
+            "Print the evidence the AI analyst would be sent for this run's selected "
+            "movers. Contacts no model and spends nothing."
+        ),
+    ),
     verbose: int = typer.Option(0, "--verbose", "-v", count=True, help=_VERBOSE_HELP),
     log_file: str | None = typer.Option(None, "--log-file", help=_LOG_FILE_HELP),
 ) -> None:
     """Rank watchlist coins by momentum (relative strength, breakout, volume, accel)."""
 
     configure_logging(verbose, log_file)
+    console = make_console()
+    # Credentials are checked after the --ai/--no-ai override resolves and before any
+    # market data is fetched, exactly as on the trend path.
     try:
         config = load_config(config_path)
+        if ai is not None:
+            config = replace(config, ai=replace(config.ai, enabled=ai))
+        reviewing = config.ai.enabled and not dry_run_ai
+        if reviewing:
+            _load_credentials_file(env_file, console)
+        analyst = _build_analyst(config) if reviewing else None
+        decision_log = DecisionLog(config.ai.decision_log) if reviewing else None
+        notifier = _build_notifier(config) if reviewing else None
     except ConfigError as exc:
         typer.secho(f"Configuration error: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
 
     market_data_provider = CcxtBinanceProvider()
-    console = Console()
     run_movers_cli(
-        market_data_provider, console, config, show_all=show_all, json_path=json_path
+        market_data_provider,
+        console,
+        config,
+        show_all=show_all,
+        json_path=json_path,
+        dry_run_ai=dry_run_ai,
+        analyst=analyst,
+        decision_log=decision_log,
+        notifier=notifier,
     )
 
 
@@ -722,7 +1575,7 @@ def market_data(
 
     configure_logging(verbose, log_file)
     provider = CcxtBinanceProvider()
-    console = Console()
+    console = make_console()
     run_market_data(provider, console, symbol, timeframe, limit, depth)
 
 
@@ -905,17 +1758,25 @@ def _trade_rows(outcomes: tuple[TradeOutcome, ...]) -> list[dict[str, object]]:
 
 
 def backtest_report_to_dict(
-    report: BacktestReport, outcomes: tuple[TradeOutcome, ...]
+    report: BacktestReport,
+    outcomes: tuple[TradeOutcome, ...],
+    run: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Serialize the summary plus the full per-trade log into a JSON-ready dict.
 
     ``profit_factor`` of infinity (wins but no losing R) is emitted as ``null`` so the
     output is valid JSON. The trade log is derived from the same outcomes summarized into
     ``report``, so the export and the printed tables are a single source of truth.
+
+    ``run`` records what produced the numbers — the traded window, the watchlist size and
+    the cost settings. Without it a saved report is not safely comparable to anything: two
+    runs over different windows or different fee assumptions produce different numbers for
+    reasons that have nothing to do with the change under test, and a delta table would
+    present that as a finding. Omitted only by callers that do not have the context.
     """
 
     pf = report.profit_factor
-    return {
+    payload: dict[str, object] = {
         "summary": {
             "resolved_trades": report.resolved_trades,
             "wins": report.wins,
@@ -956,6 +1817,33 @@ def backtest_report_to_dict(
         },
         "trades": _trade_rows(outcomes),
     }
+    if run is not None:
+        payload["run"] = run
+    return payload
+
+
+def run_metadata(
+    config: Config, start: int | None, end: int | None
+) -> dict[str, object]:
+    """Describe the run that produced a report, for comparability checks.
+
+    The window is recorded in epoch milliseconds because that is what the backtester was
+    actually given; a formatted date would invite a mismatch to slip through on a
+    formatting difference.
+    """
+
+    bt = config.backtest
+    return {
+        "window_start_ms": start,
+        "window_end_ms": end,
+        "watchlist_size": len(config.watchlist),
+        "timeframes": list(config.timeframes),
+        "reference_timeframe": config.reference_timeframe,
+        "lead_timeframe": config.lead_timeframe,
+        "fee_rate": bt.fee_rate,
+        "slippage": bt.slippage,
+        "risk_per_trade": bt.risk_per_trade,
+    }
 
 
 _TRADE_LOG_COLUMNS = [
@@ -981,6 +1869,109 @@ def write_trade_log_csv(path: str, outcomes: tuple[TradeOutcome, ...]) -> None:
             writer.writerow(row)
 
 
+class BaselineError(Exception):
+    """Raised when a baseline report cannot be loaded or is not comparable."""
+
+
+# Metric labels and the number of decimals each is worth showing.
+_DELTA_LABELS: dict[str, tuple[str, int]] = {
+    "resolved_trades": ("Resolved trades", 0),
+    "win_rate": ("Win rate %", 1),
+    "expectancy": ("Expectancy (R)", 3),
+    "profit_factor": ("Profit factor", 2),
+    "max_drawdown": ("Max drawdown %", 1),
+}
+
+# Metrics stored as fractions but read by humans as percentages.
+_PERCENT_METRICS = frozenset({"win_rate", "max_drawdown"})
+
+
+def load_baseline_summary(path: str, run: dict[str, object]) -> dict[str, object]:
+    """Load a saved report's summary, refusing one that is not comparable to this run.
+
+    Comparability is checked on the traded window, the watchlist size and the cost
+    settings, because a difference in any of those changes the numbers for reasons
+    unrelated to whatever change is being measured. Silently comparing across them would
+    manufacture a finding, which is worse than refusing.
+    """
+
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError as exc:
+        raise BaselineError(f"baseline report not found: {path}") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise BaselineError(f"baseline report is not valid JSON: {path} ({exc})") from exc
+
+    if not isinstance(payload, dict):
+        raise BaselineError(f"baseline report is not an object: {path}")
+    summary = payload.get("summary")
+    if not isinstance(summary, dict):
+        raise BaselineError(f"baseline report has no 'summary' section: {path}")
+
+    recorded = payload.get("run")
+    if not isinstance(recorded, dict):
+        raise BaselineError(
+            f"baseline report predates run metadata and cannot be checked for "
+            f"comparability: {path}. Re-generate it with --json."
+        )
+
+    mismatches = [
+        f"{key}: baseline {recorded.get(key)!r} vs current {run.get(key)!r}"
+        for key in ("window_start_ms", "window_end_ms", "watchlist_size", "fee_rate", "slippage")
+        if recorded.get(key) != run.get(key)
+    ]
+    if mismatches:
+        raise BaselineError(
+            "baseline is not comparable to this run — " + "; ".join(mismatches)
+        )
+    return summary
+
+
+def _format_metric(name: str, value: float | None, *, signed: bool = False) -> str:
+    """Render one metric value at a sensible precision, as a percentage where apt."""
+
+    if value is None:
+        return "n/a"
+    _label, places = _DELTA_LABELS.get(name, (name, 3))
+    shown = value * 100.0 if name in _PERCENT_METRICS else value
+    return f"{shown:+.{places}f}" if signed else f"{shown:.{places}f}"
+
+
+def _render_comparison(deltas: Sequence[MetricDelta], baseline_path: str, console: Console) -> None:
+    """Render the signed movement of each metric against the baseline.
+
+    Improvement and regression are marked with distinct explicit words rather than colour
+    alone, so the table still reads correctly piped to a file or in a log.
+    """
+
+    table = Table(title=f"Change vs baseline ({baseline_path})")
+    table.add_column("Metric")
+    table.add_column("Baseline", justify="right")
+    table.add_column("This run", justify="right")
+    table.add_column("Change", justify="right")
+    table.add_column("Verdict")
+
+    for delta in deltas:
+        label, _places = _DELTA_LABELS.get(delta.name, (delta.name, 3))
+        if delta.improved is True:
+            verdict, style = "BETTER", "green"
+        elif delta.improved is False:
+            verdict, style = "WORSE", "red"
+        else:
+            verdict, style = "—", ""
+        table.add_row(
+            label,
+            _format_metric(delta.name, delta.baseline),
+            _format_metric(delta.name, delta.current),
+            _format_metric(delta.name, delta.delta, signed=True),
+            verdict,
+            style=style or None,
+        )
+
+    console.print(table)
+
+
 def _finish_backtest(
     report: BacktestReport,
     outcomes: tuple[TradeOutcome, ...],
@@ -988,11 +1979,26 @@ def _finish_backtest(
     console: Console,
     json_path: str | None,
     csv_path: str | None,
+    run: dict[str, object] | None = None,
+    baseline_path: str | None = None,
 ) -> None:
+    """Render the report, optionally compare it to a baseline, and export it.
+
+    The comparison is rendered before the exports so a baseline problem surfaces without
+    the run's own results being lost.
+    """
+
     _render_backtest_report(report, skipped, console)
+
+    if baseline_path is not None and run is not None:
+        summary = load_baseline_summary(baseline_path, run)
+        current = backtest_report_to_dict(report, (), run)["summary"]
+        assert isinstance(current, dict)
+        _render_comparison(compare_summaries(summary, current), baseline_path, console)
+
     if json_path is not None:
         with open(json_path, "w", encoding="utf-8") as handle:
-            json.dump(backtest_report_to_dict(report, outcomes), handle, indent=2)
+            json.dump(backtest_report_to_dict(report, outcomes, run), handle, indent=2)
     if csv_path is not None:
         write_trade_log_csv(csv_path, outcomes)
 
@@ -1015,7 +2021,15 @@ def run_backtest(
 
     run = Backtester().run(config, histories, btc_frames)
     report = summarize(run.outcomes)
-    _finish_backtest(report, run.outcomes, run.skipped, console, json_path, csv_path)
+    _finish_backtest(
+        report,
+        run.outcomes,
+        run.skipped,
+        console,
+        json_path,
+        csv_path,
+        run=run_metadata(config, None, None),
+    )
     return report
 
 
@@ -1045,6 +2059,14 @@ def backtest(
         None,
         "--csv",
         help="Write the full per-trade log to this path as CSV (one row per trade).",
+    ),
+    baseline: str | None = typer.Option(
+        None,
+        "--baseline",
+        help=(
+            "Path to a previously-written --json report. Prints a signed change table "
+            "against it. Refuses baselines from a different window or cost settings."
+        ),
     ),
     demo: bool = typer.Option(
         False,
@@ -1086,7 +2108,7 @@ def backtest(
         )
         raise typer.Exit(code=2)
 
-    console = Console()
+    console = make_console()
     backtester = Backtester(
         fee_rate=bt.fee_rate,
         slippage=bt.slippage,
@@ -1116,7 +2138,20 @@ def backtest(
 
     run = backtester.run_from_provider(config, provider, start=start, end=end)
     report = summarize(run.outcomes, risk_per_trade=bt.risk_per_trade)
-    _finish_backtest(report, run.outcomes, run.skipped, console, json_path, csv_path)
+    try:
+        _finish_backtest(
+            report,
+            run.outcomes,
+            run.skipped,
+            console,
+            json_path,
+            csv_path,
+            run=run_metadata(config, start, end),
+            baseline_path=baseline,
+        )
+    except BaselineError as exc:
+        typer.secho(f"Baseline error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
 
 
 def _render_refresh_summary(summary: RefreshSummary, console: Console) -> None:
@@ -1195,7 +2230,7 @@ def refresh_cache(
 
     provider = CcxtHistoricalDataProvider(cache_dir=config.backtest.cache_dir)
     loader = ConcurrentHistoryLoader()
-    console = Console()
+    console = make_console()
     summary = CacheRefresher().refresh(config, provider, loader)
     _render_refresh_summary(summary, console)
 

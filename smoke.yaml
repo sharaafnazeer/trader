@@ -1,0 +1,36 @@
+# A tiny 5-coin config for checking wiring quickly — NOT for real signals.
+#
+# A full `mywatch.yaml` scan is ~435 throttled Binance requests (4-8 minutes), which is a
+# slow way to find out you typed a config key wrong. This runs the identical pipeline over
+# 5 liquid majors in well under a minute, so use it to sanity-check the AI analyst path,
+# then switch back to mywatch.yaml for anything you'd actually trade.
+#
+#   uv run trader scan --config smoke.yaml --dry-run-ai -v    # free, ~30s
+#   uv run trader scan --config smoke.yaml --ai               # one paid request
+#
+# The quality threshold is deliberately low so something surfaces to feed the analyst;
+# that is the opposite of what you want in a real config.
+profile: futures
+
+watchlist:
+  - BTCUSDT
+  - ETHUSDT
+  - SOLUSDT
+  - XRPUSDT
+  - BNBUSDT
+
+tradingview_delay: 3.5
+
+ai:
+  enabled: true
+  min_score: 50              # low on purpose, to match the threshold above
+  max_candidates: 3
+  model: gpt-5
+  api_key_env: OPENAI_API_KEY
+  input_cost_per_mtok: 1.25
+  output_cost_per_mtok: 10.0
+  decision_log: /Users/sharaafnazeer/Own/trader/.cache/decisions-smoke.jsonl
+
+telegram:
+  enabled: false
+  min_confidence: 70

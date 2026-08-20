@@ -16,7 +16,7 @@ from rich.console import Console
 from typer.testing import CliRunner
 
 from trader.cli import app, run_scan
-from trader.config import Config
+from trader.config import Config, StrategyConfig
 from trader.market_data import Candles, OrderBook
 from trader.provider import NEUTRAL, TimeframeResult
 
@@ -75,7 +75,12 @@ class FakeTradingView:
 
 def _config() -> Config:
     # A permissive threshold so the bullish coin clears the (sub-100) core-only total.
-    return Config(watchlist=["AAA", "BAD"], timeframes=["4h", "1d"], quality_threshold=40.0)
+    return Config(
+        watchlist=["AAA", "BAD"],
+        timeframes=["4h", "1d"],
+        # Checklist off: this test is about rendering and failure handling.
+        strategies=StrategyConfig(enabled=False),
+    )
 
 
 def _render(config: Config, market: FakeMarketData) -> tuple[str, object]:
@@ -89,10 +94,12 @@ def test_scan_renders_ranked_short_list_and_failure_summary() -> None:
     market = FakeMarketData(fail_ohlcv_for={"BAD"})
     output, result = _render(_config(), market)
 
-    # The surfaced coin appears in the ranked short list with its direction and score;
-    # the failed coin is skipped and summarized instead of aborting the run.
-    assert "High-conviction setups" in output
-    assert "Score/100" in output
+    # The surfaced coin appears with its direction and plan; the failed coin is skipped
+    # and summarized instead of aborting the run. The table was "High-conviction setups"
+    # with a Score column until the 0-100 score was retired — there is no conviction
+    # figure behind the list any more, only a resolved direction and a usable plan.
+    assert "Setups" in output
+    assert "Score" not in output
     assert "AAA" in output
     assert "LONG" in output
     assert "Skipped coins" in output
@@ -101,7 +108,7 @@ def test_scan_renders_ranked_short_list_and_failure_summary() -> None:
     # AAA surfaced as a setup with a positive total; BAD is a failure.
     setups = result.setups  # type: ignore[attr-defined]
     assert [s.symbol for s in setups] == ["AAA"]
-    assert setups[0].total > 0.0
+    assert setups[0].plan is not None
     assert str(setups[0].direction) == "LONG"
     assert [f.symbol for f in result.failures] == ["BAD"]  # type: ignore[attr-defined]
 

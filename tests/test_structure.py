@@ -68,22 +68,19 @@ def test_insufficient_history_is_broken_with_no_pivots() -> None:
 
 
 def _bullish_stack_features() -> TimeframeFeatures:
-    """Features with a clean bullish EMA 20/50/200 stack (the stack drives direction)."""
+    """Features with a clean bullish stack: EMA10 > EMA21 > EMA50 > SMA200."""
     return TimeframeFeatures(
         symbol="X",
         timeframe="1d",
-        ema20=3.0,
+        ema10=4.0,
+        ema21=3.0,
         ema50=2.0,
-        ema200=1.0,
-        rsi=55.0,
+        sma200=1.0,
         macd=0.0,
         macd_signal=0.0,
         macd_hist=0.0,
-        roc=0.0,
         atr=1.0,
-        obv=0.0,
-        obv_slope=0.0,
-        bollinger_width=0.0,
+        volume=1_000.0,
         relative_volume=1.0,
     )
 

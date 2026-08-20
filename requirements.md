@@ -1,1 +1,0 @@
-I want to build a trader bot which analysis the TradingView and provide insights which crypto coin to trade?

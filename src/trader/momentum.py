@@ -1,15 +1,15 @@
 """The 0-100 momentum / breakout scoring model (the "movers" engine).
 
-This is a **second, independent** scanner alongside the trend-following scoring model
-in :mod:`trader.scoring_model`. Where the trend engine rewards coins already in a
+This is a **second, independent** scanner alongside the trend-following checklist
+engine in :mod:`trader.strategy`. Where the trend engine rewards coins already in a
 clean, proven trend, this one rewards coins that are *actually moving* — outperforming
 the market, breaking out to new recent highs on real volume, and accelerating.
 
 :class:`MomentumModel.score` turns a coin's live daily candles and the per-run BTC
 benchmark return into a :class:`MomentumScore`: a total in ``0..100`` plus a
 per-factor breakdown and a direction (a strong up-move is a LONG candidate, a strong
-down-move a SHORT candidate). It mirrors :mod:`trader.scoring_model`'s
-fractional-credit × weight pattern over four factors — relative strength vs BTC,
+down-move a SHORT candidate). It scores four factors on a
+fractional-credit × weight pattern — relative strength vs BTC,
 breakout, volume expansion, and acceleration — each yielding a fraction in ``[0, 1]``
 multiplied by its configured weight, so the score is smooth rather than all-or-nothing.
 
@@ -142,6 +142,31 @@ def period_return(candles: Candles, lookback: int) -> float:
     return float(closes.iloc[-1]) / reference - 1.0
 
 
+# The rate-of-change window the acceleration factor is measured over. Previously read from
+# the shared indicator bundle; computed here since 2026-08-20, because the trend engine's
+# indicator set was closed to the trader's method and rate of change is not on it. The
+# formula mirrors the one the indicator library used, so the factor's values are unchanged.
+ROC_WINDOW = 12
+
+
+def rate_of_change(candles: Candles, window: int = ROC_WINDOW) -> float:
+    """Percentage change of ``close`` over ``window`` candles.
+
+    ``((latest - reference) / reference) * 100``, matching the shape of the indicator this
+    replaced so the acceleration factor keeps its scale. Falls back to the earliest
+    available close on a short frame and yields ``0.0`` on a degenerate one.
+    """
+
+    closes = candles.frame["close"]
+    n = len(closes)
+    if n < 2:
+        return 0.0
+    reference = float(closes.iloc[max(0, n - 1 - window)])
+    if reference <= 0.0:
+        return 0.0
+    return (float(closes.iloc[-1]) - reference) / reference * 100.0
+
+
 def _trailing_level(candles: Candles, lookback: int, direction: Direction) -> float:
     """The trailing breakout level: the prior ``lookback`` candles' high (LONG) or low.
 
@@ -237,7 +262,7 @@ class MomentumModel:
         )
 
         acceleration_fraction = _clamp01(
-            _directional(features.roc, direction) / ACCELERATION_FULL_ROC
+            _directional(rate_of_change(candles), direction) / ACCELERATION_FULL_ROC
         )
 
         fractions = {
