@@ -31,18 +31,15 @@ def _features(stack: str, timeframe: str = "1d") -> TimeframeFeatures:
     return TimeframeFeatures(
         symbol="X",
         timeframe=timeframe,
-        ema20=ema20,
+        ema10=ema20 + (ema20 - ema50) * 0.1,
+        ema21=ema20,
         ema50=ema50,
-        ema200=ema200,
-        rsi=50.0,
+        sma200=ema200,
         macd=0.0,
         macd_signal=0.0,
         macd_hist=0.0,
-        roc=0.0,
         atr=1.0,
-        obv=0.0,
-        obv_slope=0.0,
-        bollinger_width=0.0,
+        volume=1_000.0,
         relative_volume=1.0,
     )
 

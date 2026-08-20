@@ -8,6 +8,15 @@ bars' highs and lows (intrabar), and a single bar whose range spans **both** the
 and the target is counted as a loss — the conservative stop-first tie-break, so any
 reported edge is understated rather than flattered.
 
+An :class:`EntrySetup` may also carry a **pending limit**: a zone and a bar budget. Then
+the trade does not exist until a bar trades into that zone, and the recorded fill is the
+zone edge the plan nominated (``setup.entry``), never the reference close. If no bar reaches
+the zone within the budget, :meth:`TradeSimulator.simulate` returns ``None`` — *no trade
+happened*, which is a different statement from an unresolved one. This is what stops an
+entry zone below the current price from silently handing every long a better fill the market
+may never have printed: without it, moving the entry down would shrink risk and inflate
+every R-multiple, and the measured delta would look excellent and mean nothing.
+
 Costs are honest by default: a configurable ``fee_rate`` (per side) and ``slippage``
 (per fill) worsen the entry and exit fills, and the realized **R-multiple** (profit or
 loss as a multiple of the risked distance entry->stop) is computed *net* of those
@@ -50,6 +59,7 @@ class EntrySetup:
 
     ``entry_time`` is the moment (ms) the trade was entered; ``entry``/``stop``/
     ``target`` are the absolute entry, stop-loss, and take-profit prices.
+
     """
 
     symbol: str
@@ -130,7 +140,7 @@ class TradeSimulator:
         fee_rate: float = DEFAULT_FEE_RATE,
         slippage: float = DEFAULT_SLIPPAGE,
         max_holding_bars: int | None = None,
-    ) -> TradeOutcome:
+    ) -> TradeOutcome | None:
         """Walk ``finer_bars`` forward and resolve ``setup`` on first touch.
 
         For a long, a bar with ``low <= stop`` is a stop and ``high >= target`` a
@@ -143,6 +153,11 @@ class TradeSimulator:
         net R-multiple (a non-positive result is a loss — conservative). If neither level
         nor the time-stop is reached before the bars run out, the outcome is
         :attr:`TradeResult.UNRESOLVED`.
+
+        When ``setup`` carries a pending limit (see :class:`EntrySetup`), the walk first
+        looks for a bar touching the zone within the fill window; resolution then starts on
+        that same bar, because the bar that fills you can also stop you out. If the zone is
+        never touched in time, ``None`` is returned: there is no trade to report.
         """
 
         frame = finer_bars.frame
@@ -152,6 +167,7 @@ class TradeSimulator:
         highs = frame["high"].tolist()
         lows = frame["low"].tolist()
         closes = frame["close"].tolist()
+
         for idx, (bar_time_raw, high_raw, low_raw, close_raw) in enumerate(
             zip(times, highs, lows, closes, strict=True)
         ):
@@ -192,6 +208,7 @@ class TradeSimulator:
             exit_price=None,
             result=TradeResult.UNRESOLVED,
         )
+
 
     @staticmethod
     def _resolve(

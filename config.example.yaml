@@ -28,22 +28,10 @@ require_confirmation: false    # false = lower HTF must merely not oppose the le
 btc_veto: true                 # veto trades that fight BTC's regime
 long_only: false               # true = suppress short setups
 
-# --- Scoring (0-100), signals surface at or above the threshold ---
-quality_threshold: 75
-category_weights:              # must reflect the eight categories; defaults shown
-  trend: 25
-  structure: 20
-  momentum: 15
-  volume: 15
-  breakout: 10
-  btc_alignment: 5
-  liquidity: 5
-  risk_reward: 5
-
-# --- Indicator / liquidity / risk parameters ---
-relative_volume_multiple: 1.5  # volume vs rolling average for full volume credit
-min_depth: 5000.0              # order-book depth floor (quote/USDT notional, top-20 levels) for full liquidity credit
-max_spread: 0.005              # max relative spread for full liquidity credit
+# Liquidity floors. Used by the `movers` scanner to exclude untradeable coins; the trend
+# engine's liquidity scoring category was retired along with the 0-100 score.
+min_depth: 5000.0              # order-book depth floor (quote/USDT notional, top-20 levels)
+max_spread: 0.005              # maximum relative spread
 atr_buffer: 0.5                # ATR multiples padding the stop beyond invalidation
 target_rr: 2.0                 # minimum reward:risk the take-profit is floored to
 
@@ -53,6 +41,87 @@ tradingview_delay: 2.0         # seconds between TradingView requests (rate-limi
 ohlcv_lookback: 300            # candles fetched per timeframe
 # watch_interval: 300          # uncomment to default `scan --watch` to this interval
 
+# --- AI analyst (optional; disabled by default) ---
+# Reviews the setups the local engine surfaces and returns LONG/SHORT/WAIT/AVOID.
+# `min_score` and `max_candidates` are cost controls: nothing below the floor is ever
+# reviewed, and at most `max_candidates` of the survivors (highest-scoring first) are
+# selected per run. Preview exactly what would be sent with:
+#     uv run trader scan --config <file> --dry-run-ai
+# Credentials are NEVER read from this file — they come from environment variables.
+ai:
+  enabled: false               # master switch for the analyst stage
+  min_score: 75                # engine total a setup must reach to be reviewed
+  max_candidates: 5            # most candidates reviewed in a single run
+  # Slots guaranteed to each direction before the rest are filled by score. Ranking purely
+  # by score spends the whole budget on one side in a lopsided market, and a basket of
+  # same-direction positions on correlated coins is really one position. Set 0 to rank
+  # purely by score. Note it cannot reach a candidate the score floor excludes.
+  reserve_per_direction: 2
+  provider: openai             # only `openai` is implemented in this version
+  model: gpt-5                 # the model asked for the opinion
+  api_key_env: OPENAI_API_KEY  # env var holding the key — NEVER the key itself
+  max_retries: 2               # retries for a failed/malformed review
+  # temperature: 0.2           # omitted by default; some reasoning models reject it
+  # Token prices in USD per million tokens, used only to estimate what a run cost.
+  # Left at 0 the run reports "cost not configured" rather than a misleading $0.00.
+  input_cost_per_mtok: 1.25   # gpt-5 published rate; verify on your billing page
+  output_cost_per_mtok: 10.0   # gpt-5 published rate
+  # Every verdict (accepted, rejected and failed alike) is appended here as one JSON
+  # object per line, paired with the engine's own score and plan, so the analyst's
+  # contribution can later be measured against the engine acting alone.
+  decision_log: .cache/decisions.jsonl
+
+# --- Telegram alerts (optional; disabled by default) ---
+# Pushes high-confidence LONG/SHORT verdicts to your phone. WAIT and AVOID are never
+# sent however confident they are — a confident WAIT still means "do nothing".
+# Create a bot with @BotFather, then export the two variables named below.
+telegram:
+  enabled: false
+  bot_token_env: TELEGRAM_BOT_TOKEN   # env var name — NEVER the token itself
+  chat_id_env: TELEGRAM_CHAT_ID       # env var name holding your chat id
+  min_confidence: 70                  # analyst confidence needed to alert
+
+# --- Named strategies (the catalogue) ---
+# The setups from your own method, evaluated as a checklist and reported as four separate
+# facts: trend, setup, entry status, decision. WAIT is expected to be the common answer —
+# a trend existing is not an entry. See .sdd/strategy-catalogue/rules.md for the rules.
+strategies:
+  enabled: true
+  # How far price may sit beyond the EMA21-EMA50 retracement band, in ATR multiples and
+  # measured in the trade's own direction, before the entry counts as chasing. A long
+  # *below* the band is never "extended" — it has overshot the pullback, not run away.
+  max_extension_atr: 2.0
+  # The Stochastic RSI turn. The method wants an EVENT from an EXTREME: %K crossing %D the
+  # trade's way, having come from oversold (long) or overbought (short). Without the cross a
+  # falling knife looks like a signal — it is oversold the whole way down; without the
+  # extreme a mid-range wobble qualifies. Values are on the 0-1 scale the indicator reports.
+  stoch_oversold: 0.20
+  stoch_overbought: 0.80
+  cross_lookback: 3            # bars ago a cross may be and still count as "just turned"
+  # The reaction candle. The method waits for the zone to REJECT price, not merely for price
+  # to reach it: a bullish engulfing, a hammer, or a morning star at the zone (mirrored for a
+  # short). The condition is positional — a hammer away from the zone is a reaction to
+  # something else and does not count.
+  pattern_wick_body_ratio: 2.0 # times its body a wick must be to count as a rejection
+  reaction_lookback: 3         # recent bars the reaction may have formed on
+  # The trendline: a rising line under a long, a falling one over a short, drawn through the
+  # swing pivots — and price returned to it. A line through pivots that are not really
+  # collinear is a line you would never draw, so the fit quality is reported and thresholded
+  # rather than trusted; below it, the engine reports NO line instead of a weak one.
+  trendline_min_touches: 3     # pivots needed (two always fit perfectly and prove nothing)
+  trendline_min_r2: 0.7        # how well they must lie on the line, 0-1
+  trendline_tolerance_atr: 1.5 # how near price must be to count as having returned to it
+  # Which coins are worth a model's opinion, replacing the retired 0-100 score floor: a coin
+  # reaches the analyst when its checklist is within this many conditions of complete. 0
+  # reviews only fully-ready setups; 1-2 also admits the near-misses, which is where a model
+  # earns its keep — it can see a condition about to complete, or a context that makes a
+  # ticked box meaningless, and the mechanical checklist can do neither.
+  review_within: 2
+  # Recent bars of the decision timeframe sent with the evidence, so the model can read price
+  # action the five pattern predicates do not cover. The largest single contributor to prompt
+  # size, which is why it is bounded; each run reports its token cost.
+  evidence_candles: 30
+
 backtest:                      # settings for the `backtest` command (all optional)
   fee_rate: 0.0004             # per-side trading fee (net results by default; 0 for gross)
   slippage: 0.0005             # per-fill slippage
@@ -61,3 +130,27 @@ backtest:                      # settings for the `backtest` command (all option
   # start: 2024-01-01          # only trades entered on/after this date are counted
   # end: 2024-06-30            # only trades entered on/before this date are counted
   cache_dir: .cache/backtest   # where fetched historical candles are cached on disk
+
+# --- Strategy 2, the breakout family (2A long / 2B short) --------------------------------
+# Ships OFF. Unlike the trend-pullback checklist this family has never been replayed over
+# history, and an unmeasured strategy does not ship on. Turn it on to scan for it, but treat
+# its output as unproven until there is a backtest beside it.
+breakout:
+  enabled: false
+  # What makes a level "established": how many swing pivots must sit at the same price, and
+  # how near "the same price" is, in ATR. One touch is a place price turned once, not a level.
+  min_touches: 2
+  level_tolerance_atr: 0.5
+  # What separates a break from a touch: how far beyond the level the candle must *close*,
+  # and how much of that candle must be body rather than the wick that merely visited.
+  min_break_atr: 0.25
+  min_body_ratio: 0.5
+  # Volume expansion on the breaking bar, against the same 20-bar window the engine uses for
+  # relative volume. A level giving way on ordinary volume is a level nobody defended.
+  volume_multiple: 1.5
+  # Room to the next level in the break's direction, and how far past the level price may run
+  # before the entry is a chase. Beyond the chase limit the answer is "wait for the retest".
+  min_room_atr: 2.0
+  max_extension_atr: 2.0
+  # How many recent bars may contain the break. A break twenty bars old is history.
+  break_lookback: 3

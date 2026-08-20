@@ -11,7 +11,7 @@ from __future__ import annotations
 import pandas as pd
 
 from trader.backtester import BTC_CONTEXT_SYMBOL, Backtester
-from trader.config import Config
+from trader.config import Config, StrategyConfig
 from trader.market_data import Candles
 
 _HOUR = 3_600_000
@@ -29,7 +29,7 @@ def _bullish_frame(symbol: str, timeframe: str, step_ms: int, rows: int) -> Cand
     return Candles(symbol=symbol, timeframe=timeframe, frame=frame)
 
 
-def _aligned(symbol: str, reference_bars: int = 80) -> dict[str, Candles]:
+def _aligned(symbol: str, reference_bars: int = 260) -> dict[str, Candles]:
     span = 4 * _HOUR * reference_bars
     return {
         "1h": _bullish_frame(symbol, "1h", _HOUR, span // _HOUR),
@@ -58,7 +58,9 @@ def _config() -> Config:
         reference_timeframe="4h",
         lead_timeframe="4h",
         htf_timeframes=["4h"],
-        quality_threshold=0.0,
+        # Replay machinery under test, not the method: a synthetic series cannot satisfy a
+        # seven-condition checklist, and leaving it on would pin zero trades.
+        strategies=StrategyConfig(enabled=False),
     )
 
 
@@ -69,7 +71,7 @@ def test_coin_without_history_is_skipped_and_run_completes_for_the_rest() -> Non
         {"AAA": _aligned("AAA"), BTC_CONTEXT_SYMBOL: _aligned(BTC_CONTEXT_SYMBOL)}
     )
 
-    run = Backtester().run_from_provider(config, provider, start=0, end=4 * _HOUR * 80)
+    run = Backtester().run_from_provider(config, provider, start=0, end=4 * _HOUR * 260)
 
     # NODATA is recorded as skipped, not fatal; AAA still produced its trade(s).
     assert [c.symbol for c in run.skipped] == ["NODATA"]
@@ -86,12 +88,14 @@ def test_provider_sourced_run_matches_direct_injection() -> None:
         reference_timeframe="4h",
         lead_timeframe="4h",
         htf_timeframes=["4h"],
-        quality_threshold=0.0,
+        # Replay machinery under test, not the method: a synthetic series cannot satisfy a
+        # seven-condition checklist, and leaving it on would pin zero trades.
+        strategies=StrategyConfig(enabled=False),
     )
     frames = {"AAA": _aligned("AAA"), BTC_CONTEXT_SYMBOL: _aligned(BTC_CONTEXT_SYMBOL)}
     provider = _FakeProvider(frames)
 
-    via_provider = Backtester().run_from_provider(single, provider, start=0, end=4 * _HOUR * 80)
+    via_provider = Backtester().run_from_provider(single, provider, start=0, end=4 * _HOUR * 260)
     via_injection = Backtester().run(
         single, {"AAA": frames["AAA"]}, frames[BTC_CONTEXT_SYMBOL]
     )
@@ -126,14 +130,16 @@ def test_coin_whose_fetch_raises_is_skipped_and_run_completes() -> None:
         reference_timeframe="4h",
         lead_timeframe="4h",
         htf_timeframes=["4h"],
-        quality_threshold=0.0,
+        # Replay machinery under test, not the method: a synthetic series cannot satisfy a
+        # seven-condition checklist, and leaving it on would pin zero trades.
+        strategies=StrategyConfig(enabled=False),
     )
     provider = _RaisingProvider(
         {"AAA": _aligned("AAA"), BTC_CONTEXT_SYMBOL: _aligned(BTC_CONTEXT_SYMBOL)},
         failing="BBB",
     )
 
-    run = Backtester().run_from_provider(config, provider, start=0, end=4 * _HOUR * 80)
+    run = Backtester().run_from_provider(config, provider, start=0, end=4 * _HOUR * 260)
 
     assert [c.symbol for c in run.skipped] == ["BBB"]
     assert "fetch failed" in run.skipped[0].reason
@@ -149,11 +155,13 @@ def test_btc_context_fetch_failure_degrades_to_neutral() -> None:
         reference_timeframe="4h",
         lead_timeframe="4h",
         htf_timeframes=["4h"],
-        quality_threshold=0.0,
+        # Replay machinery under test, not the method: a synthetic series cannot satisfy a
+        # seven-condition checklist, and leaving it on would pin zero trades.
+        strategies=StrategyConfig(enabled=False),
     )
     provider = _RaisingProvider({"AAA": _aligned("AAA")}, failing=BTC_CONTEXT_SYMBOL)
 
-    run = Backtester().run_from_provider(config, provider, start=0, end=4 * _HOUR * 80)
+    run = Backtester().run_from_provider(config, provider, start=0, end=4 * _HOUR * 260)
 
     # No crash; AAA is still evaluated despite BTC context being unavailable.
     assert all(o.symbol == "AAA" for o in run.outcomes)
@@ -173,7 +181,9 @@ def test_concurrent_path_equals_sequential_backtest_and_metrics() -> None:
         reference_timeframe="4h",
         lead_timeframe="4h",
         htf_timeframes=["4h"],
-        quality_threshold=0.0,
+        # Replay machinery under test, not the method: a synthetic series cannot satisfy a
+        # seven-condition checklist, and leaving it on would pin zero trades.
+        strategies=StrategyConfig(enabled=False),
     )
     frames = {
         "AAA": _aligned("AAA"),
@@ -195,7 +205,7 @@ def test_concurrent_path_equals_sequential_backtest_and_metrics() -> None:
 
     # 2) Backtest via the concurrent provider path == a direct sequential injection, and
     #    the summarized report metrics match exactly.
-    via_provider = Backtester().run_from_provider(config, provider, start=0, end=4 * _HOUR * 80)
+    via_provider = Backtester().run_from_provider(config, provider, start=0, end=4 * _HOUR * 260)
     seq_hist = {s: {tf: provider.get_history(s, tf, 0, 4 * _HOUR * 80) for tf in config.timeframes}
                 for s in config.watchlist}
     via_sequential = Backtester().run(config, seq_hist, frames[BTC_CONTEXT_SYMBOL])

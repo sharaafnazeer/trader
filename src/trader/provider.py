@@ -23,8 +23,6 @@ NEUTRAL = "NEUTRAL"
 SELL = "SELL"
 STRONG_SELL = "STRONG_SELL"
 
-RECOMMENDATION_LABELS = frozenset({STRONG_BUY, BUY, NEUTRAL, SELL, STRONG_SELL})
-
 # Map internal (ccxt-style) timeframe codes to the interval strings ``tradingview-ta``
 # expects. Only the weekly code differs: ccxt uses ``"1w"`` while TradingView uses
 # ``"1W"``. Monthly (``"1M"``) and the intraday/daily codes are identical, so they

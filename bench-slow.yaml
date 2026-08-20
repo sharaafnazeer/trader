@@ -1,0 +1,32 @@
+# CONTROL for the fast-profile experiment: current 4h/1d framework, 20 liquid crypto majors.
+# Same coins and window as bench-fast.yaml so the only difference is the timeframe set.
+profile: futures
+watchlist:
+  - BTCUSDT
+  - ETHUSDT
+  - SOLUSDT
+  - XRPUSDT
+  - BNBUSDT
+  - ADAUSDT
+  - DOGEUSDT
+  - LINKUSDT
+  - AVAXUSDT
+  - DOTUSDT
+  - LTCUSDT
+  - TRXUSDT
+  - ATOMUSDT
+  - UNIUSDT
+  - FILUSDT
+  - APTUSDT
+  - ARBUSDT
+  - OPUSDT
+  - INJUSDT
+  - SEIUSDT
+
+backtest:
+  cache_dir: /Users/sharaafnazeer/Own/trader/.cache/backtest
+  fee_rate: 0.0004
+  slippage: 0.0005
+  risk_per_trade: 0.01
+  max_workers: 5
+  history_horizon_days: 1825

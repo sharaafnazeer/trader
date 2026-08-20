@@ -15,7 +15,7 @@ import pandas as pd
 from rich.console import Console
 
 from trader.cli import analysis_run_to_dict, run_scan, run_scan_forever
-from trader.config import Config, load_config
+from trader.config import Config, StrategyConfig, load_config
 from trader.direction import Direction
 from trader.market_data import Candles, OrderBook
 from trader.provider import NEUTRAL, TimeframeResult
@@ -128,7 +128,11 @@ def _run(config: Config, kinds: dict[str, str], **kwargs) -> tuple[str, object]:
 
 
 def test_bearish_coin_surfaces_as_a_short_when_not_long_only() -> None:
-    config = Config(watchlist=["BEAR"], timeframes=["4h", "1d"], quality_threshold=30.0)
+    config = Config(
+        watchlist=["BEAR"],
+        timeframes=["4h", "1d"],
+        strategies=StrategyConfig(enabled=False),
+    )
     _, result = _run(config, {"BEAR": "bear"})
     directions = {s.symbol: s.direction for s in result.setups}  # type: ignore[attr-defined]
     assert directions.get("BEAR") is Direction.SHORT
@@ -138,8 +142,8 @@ def test_long_only_excludes_short_setups() -> None:
     config = Config(
         watchlist=["BULL", "BEAR"],
         timeframes=["4h", "1d"],
-        quality_threshold=30.0,
         long_only=True,
+        strategies=StrategyConfig(enabled=False),
     )
     _, result = _run(config, {"BULL": "bull", "BEAR": "bear"})
     setups = result.setups  # type: ignore[attr-defined]
@@ -148,47 +152,12 @@ def test_long_only_excludes_short_setups() -> None:
     assert "BEAR" not in {s.symbol for s in setups}
 
 
-def test_all_flag_includes_no_direction_coin_while_default_excludes_it() -> None:
-    config = Config(watchlist=["BULL", "FLAT"], timeframes=["4h", "1d"], quality_threshold=30.0)
-
-    default_out, result = _run(config, {"BULL": "bull", "FLAT": "flat"})
-    all_out, _ = _run(config, {"BULL": "bull", "FLAT": "flat"}, show_all=True)
-
-    # FLAT has no direction -> never a setup; the default short list omits it.
-    assert "BULL" in default_out
-    assert "FLAT" not in default_out
-    assert "FLAT" not in {s.symbol for s in result.setups}  # type: ignore[attr-defined]
-    # --all widens the view to every analyzed coin, including the no-direction one.
-    assert "BULL" in all_out
-    assert "FLAT" in all_out
-
-
-def test_all_flag_includes_sub_threshold_coin() -> None:
-    # An unreachably high threshold surfaces nothing, but --all still lists the coin.
-    config = Config(watchlist=["BULL"], timeframes=["4h", "1d"], quality_threshold=100.0)
-    default_out, result = _run(config, {"BULL": "bull"})
-    all_out, _ = _run(config, {"BULL": "bull"}, show_all=True)
-
-    assert result.setups == ()  # type: ignore[attr-defined]
-    assert "BULL" not in default_out
-    assert "BULL" in all_out
-
-
-def test_details_flag_expands_the_category_breakdown() -> None:
-    config = Config(watchlist=["BULL"], timeframes=["4h", "1d"], quality_threshold=30.0)
-    plain_out, _ = _run(config, {"BULL": "bull"})
-    details_out, _ = _run(config, {"BULL": "bull"}, details=True)
-
-    # The category breakdown only appears with --details.
-    assert "trend=" not in plain_out
-    assert "trend=" in details_out
-    assert "structure=" in details_out
-
-
-def test_json_record_reloads_to_the_same_directions_totals_and_plans(tmp_path) -> None:
+def test_json_record_reloads_to_the_same_directions_and_plans(tmp_path) -> None:
     json_path = tmp_path / "out.json"
     config = Config(
-        watchlist=["BULL", "BEAR", "FLAT"], timeframes=["4h", "1d"], quality_threshold=30.0
+        watchlist=["BULL", "BEAR", "FLAT"],
+        timeframes=["4h", "1d"],
+        strategies=StrategyConfig(enabled=False),
     )
     _, result = _run(
         config, {"BULL": "bull", "BEAR": "bear", "FLAT": "flat"}, json_path=str(json_path)
@@ -199,13 +168,12 @@ def test_json_record_reloads_to_the_same_directions_totals_and_plans(tmp_path) -
     # The JSON is derived from the same in-memory AnalysisRun as the table.
     assert reloaded == analysis_run_to_dict(result)  # type: ignore[arg-type]
 
-    # Surfaced short list (directions + totals) matches the table's setups exactly.
+    # Surfaced short list matches the table's setups exactly.
     assert reloaded["setups"] == [s.symbol for s in result.setups]  # type: ignore[attr-defined]
     coins_by_symbol = {c["symbol"]: c for c in reloaded["coins"]}
     for setup in result.setups:  # type: ignore[attr-defined]
         coin = coins_by_symbol[setup.symbol]
         assert coin["direction"] == setup.direction.value
-        assert coin["total"] == setup.total
         assert coin["surfaced"] is True
 
     # Trade-plan values round-trip for every coin that has a plan.
@@ -221,7 +189,11 @@ def test_json_record_reloads_to_the_same_directions_totals_and_plans(tmp_path) -
 
 
 def test_watch_loop_runs_n_times_and_sleeps_with_interval() -> None:
-    config = Config(watchlist=["BULL"], timeframes=["4h", "1d"], quality_threshold=30.0)
+    config = Config(
+        watchlist=["BULL"],
+        timeframes=["4h", "1d"],
+        strategies=StrategyConfig(enabled=False),
+    )
     market = FakeMarketData({"BULL": "bull"})
     console = Console(width=240, force_terminal=False)
     sleeps: list[float] = []
@@ -249,7 +221,11 @@ def test_relaxed_rule_surfaces_coin_old_rule_hid_and_none_coin_shows_reason(tmp_
     # "both higher timeframes must agree" gate returned NONE, the relaxed rule surfaces
     # it LONG. FLAT stays NONE and must show a reason in both the table and the JSON.
     json_path = tmp_path / "out.json"
-    config = Config(watchlist=["RELAX", "FLAT"], timeframes=["4h", "1d"], quality_threshold=0.0)
+    config = Config(
+        watchlist=["RELAX", "FLAT"],
+        timeframes=["4h", "1d"],
+        strategies=StrategyConfig(enabled=False),
+    )
     market = PerTimeframeMarketData(
         {
             "RELAX": {"1d": "bull", "4h": "flat"},
@@ -269,9 +245,14 @@ def test_relaxed_rule_surfaces_coin_old_rule_hid_and_none_coin_shows_reason(tmp_
         )
     out = capture.get()
 
-    # The relaxed rule surfaces the coin whose lead is decided and un-opposed.
-    setups = {s.symbol: s.direction for s in result.setups}  # type: ignore[attr-defined]
-    assert setups.get("RELAX") is Direction.LONG
+    # The relaxed rule *decides* a direction for the coin whose lead is clean and
+    # un-opposed. Asserted on the analysis rather than on ``setups``, because surfacing now
+    # also requires a usable trade plan and this fixture's monotonic series has no swing
+    # low to anchor a stop to — which is a fact about the fixture, not about the rule
+    # under test.
+    relax = next(a for a in result.analyses if a.symbol == "RELAX")  # type: ignore[attr-defined]
+    assert relax.direction is Direction.LONG
+    assert relax.reason is None
 
     # The still-NONE coin carries a concrete reason on its result, in the --all table,
     # and in the JSON record.
@@ -285,14 +266,15 @@ def test_relaxed_rule_surfaces_coin_old_rule_hid_and_none_coin_shows_reason(tmp_
     assert coins["FLAT"]["direction"] == "NONE"
     assert coins["FLAT"]["reason"] == "lead_unresolved"
     assert coins["RELAX"]["reason"] is None
-    assert coins["RELAX"]["surfaced"] is True
 
 
 class ShortHistoryMarketData:
     """Fake provider returning short (limited-history) bullish candles for every coin.
 
-    ``rows`` sits below the slow-EMA window so the features degrade and the coin is
-    flagged limited-history, while still resolving a LONG direction and surfacing.
+    ``rows`` sits below the 200-period window, so the long-term average is reported absent
+    and the coin is flagged limited-history. It resolves no direction as a result — the
+    method's stack cannot be judged without its filter — and is reported rather than
+    surfaced.
     """
 
     def __init__(self, rows: int = 120) -> None:
@@ -308,8 +290,19 @@ class ShortHistoryMarketData:
 
 
 def test_limited_history_marker_shows_in_all_view_and_json(tmp_path) -> None:
+    """A coin too young for the 200-period filter is reported, not silently dropped.
+
+    It no longer resolves a direction — the method's stack cannot be judged without its
+    long-term average, and that average is reported absent rather than back-filled — so
+    what this pins is that the coin is still evaluated, still listed under ``--all``, and
+    still carries the marker explaining the silence.
+    """
     json_path = tmp_path / "out.json"
-    config = Config(watchlist=["YOUNG"], timeframes=["4h", "1d"], quality_threshold=0.0)
+    config = Config(
+        watchlist=["YOUNG"],
+        timeframes=["4h", "1d"],
+        strategies=StrategyConfig(enabled=False),
+    )
     market = ShortHistoryMarketData(rows=120)  # too short for the slow EMA
     console = Console(width=240, force_terminal=False)
     with console.capture() as capture:
@@ -324,10 +317,10 @@ def test_limited_history_marker_shows_in_all_view_and_json(tmp_path) -> None:
         )
     out = capture.get()
 
-    # The coin is still evaluated and surfaces despite limited history.
     young = next(a for a in result.analyses if a.symbol == "YOUNG")  # type: ignore[attr-defined]
     assert young.limited_history is True
-    assert young.direction is Direction.LONG
+    assert young.direction is Direction.NONE
+    assert young.symbol not in {a.symbol for a in result.setups}  # type: ignore[attr-defined]
 
     # The marker is visible in the --all table and in the JSON record.
     assert "limited" in out
@@ -340,7 +333,7 @@ def test_config_yaml_settings_drive_the_run(tmp_path) -> None:
     # --config path: a YAML watchlist + long_only flow through load_config into the run.
     path = tmp_path / "config.yaml"
     path.write_text(
-        "watchlist: [BULL, BEAR]\ntimeframes: [4h, 1d]\nquality_threshold: 30\nlong_only: true\n",
+        "watchlist: [BULL, BEAR]\ntimeframes: [4h, 1d]\nlong_only: true\n",
         encoding="utf-8",
     )
     config = load_config(str(path))

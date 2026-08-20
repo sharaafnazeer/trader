@@ -72,11 +72,19 @@ class MarketContext:
 
 
 def _ema_stack(features: TimeframeFeatures) -> Direction:
-    """Direction implied by the EMA 20/50/200 stacking, or ``NONE`` if not stacked."""
+    """Direction implied by the method's stack, or ``NONE`` if it is not stacked.
 
-    if features.ema20 > features.ema50 > features.ema200:
+    The stack is ``EMA10 > EMA21 > EMA50 > SMA200`` for an uptrend and the mirror for a
+    downtrend — the trader's own definition, replacing the EMA 20/50/200 ordering the
+    engine used before 2026-08-20. A timeframe whose 200-period average is absent (too
+    little history) has no long-term filter to judge against, so every comparison against
+    ``NaN`` is false and the timeframe resolves ``NONE``. That is the intended outcome: a
+    coin too young to have the filter has not established the trend the method requires.
+    """
+
+    if features.ema10 > features.ema21 > features.ema50 > features.sma200:
         return Direction.LONG
-    if features.ema20 < features.ema50 < features.ema200:
+    if features.ema10 < features.ema21 < features.ema50 < features.sma200:
         return Direction.SHORT
     return Direction.NONE
 
@@ -84,7 +92,7 @@ def _ema_stack(features: TimeframeFeatures) -> Direction:
 def _timeframe_direction(features: TimeframeFeatures, state: StructureState) -> Direction:
     """Direction of a single timeframe: the EMA stack drives it, structure only vetoes.
 
-    The EMA 20/50/200 stack decides the candidate direction. Market structure vetoes
+    The method's stack decides the candidate direction. Market structure vetoes
     that candidate only when it *clearly opposes* it — a bullish stack is vetoed by
     ``BEARISH`` structure and a bearish stack by ``BULLISH`` structure. A ``BROKEN`` or
     otherwise non-opposing structure is allowed, so a choppy-but-trending market still

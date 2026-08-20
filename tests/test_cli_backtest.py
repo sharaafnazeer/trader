@@ -23,7 +23,7 @@ from trader.cli import (
     run_backtest,
     write_trade_log_csv,
 )
-from trader.config import Config
+from trader.config import Config, StrategyConfig
 from trader.direction import Direction
 from trader.market_data import Candles
 from trader.metrics import summarize
@@ -46,7 +46,7 @@ def _bullish_frame(symbol: str, timeframe: str, step_ms: int, rows: int) -> Cand
     return Candles(symbol=symbol, timeframe=timeframe, frame=frame)
 
 
-def _aligned(symbol: str, reference_bars: int = 80) -> dict[str, Candles]:
+def _aligned(symbol: str, reference_bars: int = 260) -> dict[str, Candles]:
     span = 4 * _HOUR * reference_bars
     return {
         "1h": _bullish_frame(symbol, "1h", _HOUR, span // _HOUR),
@@ -61,7 +61,8 @@ def _config() -> Config:
         reference_timeframe="4h",
         lead_timeframe="4h",
         htf_timeframes=["4h"],
-        quality_threshold=0.0,
+        # Replay machinery under test, not the method — see baseline_fixture.py.
+        strategies=StrategyConfig(enabled=False),
     )
 
 
@@ -86,13 +87,13 @@ def test_run_backtest_prints_count_and_win_rate() -> None:
 
 def test_demo_history_covers_the_watchlist_and_btc() -> None:
     config = _config()
-    histories, btc_frames = demo_history(config, reference_bars=40)
+    histories, btc_frames = demo_history(config, reference_bars=260)
     assert set(histories) == {"AAA"}
     assert set(histories["AAA"]) == {"1h", "4h"}
     assert set(btc_frames) == {"1h", "4h"}
     # Timeframes are aligned to a common span: the 1h frame has ~4x the 4h bars.
-    assert len(histories["AAA"]["4h"].frame) == 40
-    assert len(histories["AAA"]["1h"].frame) == 160
+    assert len(histories["AAA"]["4h"].frame) == 260
+    assert len(histories["AAA"]["1h"].frame) == 1040
 
 
 def test_backtest_command_help_exits_zero() -> None:
@@ -112,7 +113,6 @@ def test_backtest_command_runs_over_injected_history_exit_zero(tmp_path) -> None
                 "reference_timeframe: 4h",
                 "lead_timeframe: 4h",
                 "htf_timeframes: [4h]",
-                "quality_threshold: 0.0",
             ]
         ),
         encoding="utf-8",
@@ -230,7 +230,6 @@ def _range_config_file(tmp_path):  # type: ignore[no-untyped-def]
                 "reference_timeframe: 4h",
                 "lead_timeframe: 4h",
                 "htf_timeframes: [4h]",
-                "quality_threshold: 0.0",
             ]
         ),
         encoding="utf-8",
@@ -272,7 +271,6 @@ def test_backtest_command_writes_json_and_csv(tmp_path) -> None:  # type: ignore
                 "reference_timeframe: 4h",
                 "lead_timeframe: 4h",
                 "htf_timeframes: [4h]",
-                "quality_threshold: 0.0",
             ]
         ),
         encoding="utf-8",

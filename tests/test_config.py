@@ -10,7 +10,6 @@ from trader.config import (
     DEFAULT_ATR_BUFFER,
     DEFAULT_BINANCE_DELAY,
     DEFAULT_BTC_VETO,
-    DEFAULT_CATEGORY_WEIGHTS,
     DEFAULT_EXCHANGE,
     DEFAULT_HTF_TIMEFRAMES,
     DEFAULT_LEAD_TIMEFRAME,
@@ -19,10 +18,7 @@ from trader.config import (
     DEFAULT_MIN_DEPTH,
     DEFAULT_OHLCV_LOOKBACK,
     DEFAULT_PROFILE,
-    DEFAULT_QUALITY_THRESHOLD,
     DEFAULT_REFERENCE_TIMEFRAME,
-    DEFAULT_RELATIVE_VOLUME_MULTIPLE,
-    DEFAULT_REQUEST_DELAY,
     DEFAULT_REQUIRE_CONFIRMATION,
     DEFAULT_SCREENER,
     DEFAULT_TARGET_RR,
@@ -30,7 +26,6 @@ from trader.config import (
     DEFAULT_TRADINGVIEW_BATCH_SIZE,
     DEFAULT_TRADINGVIEW_DELAY,
     DEFAULT_WATCHLIST,
-    DEFAULT_WEIGHTS,
     Config,
     ConfigError,
     ResolvedProfile,
@@ -52,13 +47,8 @@ def test_none_path_returns_defaults() -> None:
     assert config.exchange == DEFAULT_EXCHANGE
     assert config.screener == DEFAULT_SCREENER
     assert config.timeframes == DEFAULT_TIMEFRAMES
-    assert config.weights == DEFAULT_WEIGHTS
-    assert config.request_delay == DEFAULT_REQUEST_DELAY
     assert config.watch_interval is None
     # New multi-factor settings all fall back to their documented defaults.
-    assert config.category_weights == DEFAULT_CATEGORY_WEIGHTS
-    assert config.quality_threshold == DEFAULT_QUALITY_THRESHOLD
-    assert config.relative_volume_multiple == DEFAULT_RELATIVE_VOLUME_MULTIPLE
     assert config.min_depth == DEFAULT_MIN_DEPTH
     assert config.max_spread == DEFAULT_MAX_SPREAD
     assert config.atr_buffer == DEFAULT_ATR_BUFFER
@@ -76,6 +66,32 @@ def test_none_path_returns_defaults() -> None:
     assert config.tradingview_delay == DEFAULT_TRADINGVIEW_DELAY
     assert config.ohlcv_lookback == DEFAULT_OHLCV_LOOKBACK
     assert config.long_only == DEFAULT_LONG_ONLY
+@pytest.mark.parametrize(
+    "key,body",
+    [
+        ("quality_threshold", "quality_threshold: 80"),
+        ("category_weights", "category_weights:\n  trend: 25"),
+        ("relative_volume_multiple", "relative_volume_multiple: 1.5"),
+        ("entry", "entry:\n  quality: true"),
+        ("weights", "weights:\n  4h: 1.0"),
+        ("request_delay", "request_delay: 0.5"),
+    ],
+)
+def test_a_retired_setting_is_rejected_with_an_explanation(tmp_path, key, body) -> None:
+    """A removed setting must not read as a typo.
+
+    These four were real settings that were deliberately deleted when the indicator set was
+    closed to the trader's method. The generic "unknown configuration key" error would send
+    a reader hunting for a spelling mistake, so each is named with what happened to it.
+    """
+
+    path = tmp_path / "config.yaml"
+    path.write_text(f"watchlist: [BTCUSDT]\n{body}\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=f"'{key}' was removed"):
+        load_config(str(path))
+
+
 
 
 def test_valid_yaml_parses_into_expected_config(tmp_path: Path) -> None:
@@ -86,22 +102,7 @@ def test_valid_yaml_parses_into_expected_config(tmp_path: Path) -> None:
         exchange: KRAKEN
         screener: america
         timeframes: [1h, 1d]
-        weights:
-          1h: 1.0
-          1d: 4.0
-        request_delay: 0.25
         watch_interval: 60
-        category_weights:
-          trend: 30
-          structure: 20
-          momentum: 15
-          volume: 15
-          breakout: 10
-          btc_alignment: 5
-          liquidity: 5
-          risk_reward: 5
-        quality_threshold: 80
-        relative_volume_multiple: 2.0
         min_depth: 100
         max_spread: 0.002
         atr_buffer: 1.0
@@ -121,21 +122,7 @@ def test_valid_yaml_parses_into_expected_config(tmp_path: Path) -> None:
         exchange="KRAKEN",
         screener="america",
         timeframes=["1h", "1d"],
-        weights={"1h": 1.0, "1d": 4.0},
-        request_delay=0.25,
         watch_interval=60.0,
-        category_weights={
-            "trend": 30.0,
-            "structure": 20.0,
-            "momentum": 15.0,
-            "volume": 15.0,
-            "breakout": 10.0,
-            "btc_alignment": 5.0,
-            "liquidity": 5.0,
-            "risk_reward": 5.0,
-        },
-        quality_threshold=80.0,
-        relative_volume_multiple=2.0,
         min_depth=100.0,
         max_spread=0.002,
         atr_buffer=1.0,
@@ -162,11 +149,7 @@ def test_omitted_fields_receive_defaults(tmp_path: Path) -> None:
     assert config.exchange == DEFAULT_EXCHANGE
     assert config.screener == DEFAULT_SCREENER
     assert config.timeframes == DEFAULT_TIMEFRAMES
-    assert config.weights == DEFAULT_WEIGHTS
-    assert config.request_delay == DEFAULT_REQUEST_DELAY
     assert config.watch_interval is None
-    assert config.category_weights == DEFAULT_CATEGORY_WEIGHTS
-    assert config.quality_threshold == DEFAULT_QUALITY_THRESHOLD
     assert config.long_only == DEFAULT_LONG_ONLY
 
 
@@ -202,14 +185,6 @@ def test_empty_watchlist_raises_config_error(tmp_path: Path) -> None:
     path = _write(tmp_path, "watchlist: []\n")
     with pytest.raises(ConfigError, match="non-empty list"):
         load_config(path)
-
-
-def test_negative_request_delay_raises_config_error(tmp_path: Path) -> None:
-    path = _write(tmp_path, "request_delay: -1.0\n")
-    with pytest.raises(ConfigError, match="request_delay must be non-negative"):
-        load_config(path)
-
-
 def test_non_positive_watch_interval_raises_config_error(tmp_path: Path) -> None:
     path = _write(tmp_path, "watch_interval: 0\n")
     with pytest.raises(ConfigError, match="watch_interval must be positive"):
@@ -220,39 +195,10 @@ def test_unknown_key_raises_config_error(tmp_path: Path) -> None:
     path = _write(tmp_path, "waatchlist: [BTCUSDT]\n")
     with pytest.raises(ConfigError, match="unknown configuration key"):
         load_config(path)
-
-
-def test_boolean_is_rejected_as_number(tmp_path: Path) -> None:
-    # bool is a subclass of int; it must not be silently accepted as a threshold.
-    path = _write(tmp_path, "quality_threshold: true\n")
-    with pytest.raises(ConfigError, match="quality_threshold"):
-        load_config(path)
-
-
-def test_negative_category_weight_raises_config_error(tmp_path: Path) -> None:
-    path = _write(tmp_path, "category_weights:\n  trend: -1\n")
-    with pytest.raises(ConfigError, match="category weight for 'trend' must be non-negative"):
-        load_config(path)
-
-
-def test_quality_threshold_out_of_range_raises_config_error(tmp_path: Path) -> None:
-    path = _write(tmp_path, "quality_threshold: 150\n")
-    with pytest.raises(ConfigError, match="quality_threshold must be between 0 and 100"):
-        load_config(path)
-
-
 def test_non_positive_target_rr_raises_config_error(tmp_path: Path) -> None:
     path = _write(tmp_path, "target_rr: 0\n")
     with pytest.raises(ConfigError, match="target_rr must be positive"):
         load_config(path)
-
-
-def test_non_positive_relative_volume_multiple_raises_config_error(tmp_path: Path) -> None:
-    path = _write(tmp_path, "relative_volume_multiple: 0\n")
-    with pytest.raises(ConfigError, match="relative_volume_multiple must be positive"):
-        load_config(path)
-
-
 def test_non_positive_ohlcv_lookback_raises_config_error(tmp_path: Path) -> None:
     path = _write(tmp_path, "ohlcv_lookback: 0\n")
     with pytest.raises(ConfigError, match="ohlcv_lookback must be positive"):

@@ -46,6 +46,18 @@ class Candles:
         """The close price of the most recent candle."""
         return float(self.frame["close"].iloc[-1])
 
+    @property
+    def latest_open_time(self) -> int:
+        """The open time of the most recent candle, in epoch milliseconds.
+
+        The live fetch includes the *forming* candle, so this value stays fixed for the
+        whole life of a bar and steps forward exactly when a new one opens. That makes it
+        the natural "has the market actually moved on?" key for anything that must not
+        repeat work within a single candle.
+        """
+
+        return int(self.frame["timestamp"].iloc[-1])
+
 
 @dataclass(frozen=True)
 class OrderBook:

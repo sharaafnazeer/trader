@@ -11,18 +11,10 @@ from __future__ import annotations
 import logging
 
 import pandas as pd
+import pytest
 
-from trader.config import (
-    DEFAULT_CATEGORY_WEIGHTS,
-    DEFAULT_MAX_SPREAD,
-    DEFAULT_MIN_DEPTH,
-    DEFAULT_REFERENCE_TIMEFRAME,
-    DEFAULT_RELATIVE_VOLUME_MULTIPLE,
-    DEFAULT_TARGET_RR,
-)
-from trader.direction import DEFAULT_LEAD_TIMEFRAME, Direction, MarketContext, decide
-from trader.indicators import compute_features
-from trader.market_data import DEFAULT_OHLCV_LIMIT, Candles, OrderBook
+from trader.direction import Direction
+from trader.market_data import Candles, OrderBook
 from trader.provider import (
     BUY,
     NEUTRAL,
@@ -31,10 +23,8 @@ from trader.provider import (
     STRONG_SELL,
     TimeframeResult,
 )
-from trader.runner import CoinAnalysis, Runner
+from trader.runner import Runner
 from trader.scoring import LABEL_VALUES
-from trader.scoring_model import QualityScore, ScoringModel, surface
-from trader.structure import analyze as analyze_structure
 
 
 def _rising_candles(symbol: str, timeframe: str, rows: int = 40) -> Candles:
@@ -168,7 +158,6 @@ def test_spot_profile_drives_weekly_monthly_evaluation_and_weekly_levels() -> No
         lead_timeframe="1M",
         htf_timeframes=("1w", "1M"),
         reference_timeframe="1w",
-        quality_threshold=0.0,
     )
 
     alt_tfs = {tf for (sym, tf, _) in market.ohlcv_calls if sym == "ALT"}
@@ -202,7 +191,6 @@ def test_spot_profile_computes_btc_context_on_profile_timeframes() -> None:
         lead_timeframe="1M",
         htf_timeframes=("1w", "1M"),
         reference_timeframe="1w",
-        quality_threshold=0.0,
     )
 
     btc_tfs = {tf for (sym, tf, _) in market.ohlcv_calls if sym == "BTC/USDT"}
@@ -236,9 +224,11 @@ class ShortHistoryMarketData:
         )
 
 
-def test_limited_history_coin_is_still_evaluated_surfaces_and_marks_the_result() -> None:
-    # 120-row frames are too short for the slow EMA: the coin degrades to a fallback
-    # stack. It must still resolve a direction (not be dropped) and carry the marker.
+def test_limited_history_coin_is_marked_and_resolves_no_direction() -> None:
+    # 120-row frames cannot define a 200-period average. That average is the method's
+    # long-term filter, and it is reported absent rather than back-filled from a shorter
+    # window — so the stack cannot be judged and the coin resolves no direction. The coin
+    # is still evaluated and still reported; it simply is not a setup.
     market = ShortHistoryMarketData(kind="bull", rows=120)
     tv = FakeTradingView()
 
@@ -247,15 +237,12 @@ def test_limited_history_coin_is_still_evaluated_surfaces_and_marks_the_result()
         analysis=tv,
         watchlist=["YOUNG"],
         timeframes=["4h", "1d"],
-        quality_threshold=0.0,
     )
 
     (analysis,) = result.analyses
     assert analysis.limited_history is True
-    # Still evaluated and surfaceable: a decided direction with no gating reason.
-    assert analysis.direction is Direction.LONG
-    assert analysis.reason is None
-    assert analysis.symbol in {s.symbol for s in result.setups}
+    assert analysis.direction is Direction.NONE
+    assert analysis.symbol not in {a.symbol for a in result.setups}
 
 
 def test_full_history_coin_is_not_marked_limited_history() -> None:
@@ -267,7 +254,6 @@ def test_full_history_coin_is_not_marked_limited_history() -> None:
         analysis=tv,
         watchlist=["MATURE"],
         timeframes=["4h", "1d"],
-        quality_threshold=0.0,
     )
 
     (analysis,) = result.analyses
@@ -406,50 +392,6 @@ class TableTradingView:
 _EQUIV_BASES = {"4h": 300.0, "1d": 400.0}
 
 
-def _btc_context(market: SpotFakeMarketData, timeframes: list[str]) -> MarketContext:
-    """Recompute the once-per-run BTC market context exactly as ``run_analysis`` does."""
-    btc = {tf: market.get_ohlcv("BTC/USDT", tf, DEFAULT_OHLCV_LIMIT) for tf in timeframes}
-    feats = {tf: compute_features(c) for tf, c in btc.items()}
-    structs = {tf: analyze_structure(c) for tf, c in btc.items()}
-    direction = decide(
-        feats,
-        structs,
-        MarketContext(),
-        htf_timeframes=tuple(timeframes[-2:]),
-        lead_timeframe=DEFAULT_LEAD_TIMEFRAME,
-        require_confirmation=False,
-        btc_veto=True,
-    ).direction
-    return MarketContext(btc_direction=direction)
-
-
-def _reference_score(
-    analysis: CoinAnalysis, tv_value: float | None, context: MarketContext
-) -> QualityScore:
-    """Score a coin from its own runner-produced inputs, overriding only ``tradingview``.
-
-    Uses the runner's default scoring parameters (from config) and the exact
-    features/structure/order book the runner built, so a match proves the runner fed
-    ``tv_value`` and left every other factor unchanged.
-    """
-    return ScoringModel().score(
-        symbol=analysis.symbol,
-        direction=analysis.direction,
-        features_by_tf=analysis.features_by_tf,
-        structure_by_tf=analysis.structure_by_tf,
-        btc_context=context,
-        weights=dict(DEFAULT_CATEGORY_WEIGHTS),
-        tradingview=tv_value,
-        order_book=analysis.order_book,
-        close_by_tf={tf: c.latest_close for tf, c in analysis.candles_by_tf.items()},
-        relative_volume_multiple=DEFAULT_RELATIVE_VOLUME_MULTIPLE,
-        min_depth=DEFAULT_MIN_DEPTH,
-        max_spread=DEFAULT_MAX_SPREAD,
-        risk_reward=analysis.plan.risk_reward if analysis.plan is not None else None,
-        target_rr=DEFAULT_TARGET_RR,
-    )
-
-
 def test_batch_fetch_called_once_per_interval_and_never_per_coin() -> None:
     market = FakeMarketData()
     watchlist = ["AAA", "BBB", "CCC"]
@@ -470,57 +412,6 @@ def test_batch_fetch_called_once_per_interval_and_never_per_coin() -> None:
     # Every batch covered the whole watchlist in a single request.
     for symbols, _exchange, _screener, _interval in tv.batch_calls:
         assert symbols == tuple(watchlist)
-
-
-def test_scan_scoring_equivalence_from_a_fixed_recommendation_table() -> None:
-    market = SpotFakeMarketData(
-        kinds={"AAA": "bull", "BBB": "bull", "BTC/USDT": "bull"}, bases=_EQUIV_BASES
-    )
-    timeframes = ["4h", "1d"]
-    # A fixed per-(symbol, interval) recommendation table drives the batch fake.
-    table = {
-        ("AAA", "4h"): STRONG_BUY,
-        ("AAA", "1d"): BUY,
-        ("BBB", "4h"): SELL,
-        ("BBB", "1d"): STRONG_SELL,
-    }
-    tv = TableTradingView(table)
-
-    result = Runner(sleep=lambda _: None).run_analysis(
-        market_data=market,
-        analysis=tv,
-        watchlist=["AAA", "BBB"],
-        timeframes=timeframes,
-        reference_timeframe=DEFAULT_REFERENCE_TIMEFRAME,
-        quality_threshold=0.0,
-    )
-
-    context = _btc_context(market, timeframes)
-    expected_scores: dict[str, QualityScore] = {}
-    for analysis in result.analyses:
-        # tv_value is the mean of LABEL_VALUES over the coin's configured intervals.
-        expected_tv = sum(LABEL_VALUES[table[(analysis.symbol, tf)]] for tf in timeframes) / len(
-            timeframes
-        )
-        expected = _reference_score(analysis, expected_tv, context)
-        expected_scores[analysis.symbol] = expected
-        assert analysis.score is not None
-        assert analysis.score == expected
-
-    # A distinctive, non-zero tv_value was actually exercised per coin.
-    assert (
-        sum(LABEL_VALUES[table[("AAA", tf)]] for tf in timeframes) / len(timeframes) == 1.5
-    )
-    assert (
-        sum(LABEL_VALUES[table[("BBB", tf)]] for tf in timeframes) / len(timeframes) == -1.5
-    )
-
-    # Surfaced setups match those computed directly from the table-derived scores.
-    expected_setups = surface(list(expected_scores.values()), 0.0)
-    assert [s.symbol for s in result.setups] == [s.symbol for s in expected_setups]
-    assert [s.total for s in result.setups] == [s.total for s in expected_setups]
-
-
 def test_whole_interval_batch_failure_degrades_that_interval_for_every_coin(
     caplog,
 ) -> None:
@@ -543,7 +434,6 @@ def test_whole_interval_batch_failure_degrades_that_interval_for_every_coin(
             analysis=tv,
             watchlist=["AAA", "BBB"],
             timeframes=timeframes,
-            quality_threshold=0.0,
         )
 
     # Exactly one warning, naming the degraded interval.
@@ -551,15 +441,12 @@ def test_whole_interval_batch_failure_degrades_that_interval_for_every_coin(
         r for r in caplog.records if "TradingView batch degraded for interval 4h" in r.getMessage()
     ]
     assert len(warnings) == 1
-    # Scan completes for every coin.
-    assert [a.symbol for a in result.analyses] == ["AAA", "BBB"]
+    # The scan completes for every coin, and the surviving interval's recommendation is
+    # still carried — degraded, not lost.
+    assert {a.symbol for a in result.analyses} == {"AAA", "BBB"}
+    assert all(a.tradingview is not None for a in result.analyses)
 
-    # Every coin's tv contribution comes from the surviving "1d" interval only.
-    context = _btc_context(market, timeframes)
-    for analysis in result.analyses:
-        expected_tv = float(LABEL_VALUES[table[(analysis.symbol, "1d")]])
-        assert analysis.score is not None
-        assert analysis.score == _reference_score(analysis, expected_tv, context)
+
 
 
 def test_symbol_missing_from_one_interval_loses_only_its_own_contribution(caplog) -> None:
@@ -581,26 +468,20 @@ def test_symbol_missing_from_one_interval_loses_only_its_own_contribution(caplog
             analysis=tv,
             watchlist=["AAA", "BBB"],
             timeframes=timeframes,
-            quality_threshold=0.0,
         )
 
     # A missing symbol in one interval is not a degradation warning.
     assert not any("degraded for interval" in r.getMessage() for r in caplog.records)
 
-    context = _btc_context(market, timeframes)
     by_symbol = {a.symbol: a for a in result.analyses}
 
-    # AAA unaffected: both intervals contribute.
-    aaa = by_symbol["AAA"]
+    # AAA unaffected: both intervals contribute to its aggregate.
     aaa_tv = sum(LABEL_VALUES[table[("AAA", tf)]] for tf in timeframes) / len(timeframes)
-    assert aaa.score is not None
-    assert aaa.score == _reference_score(aaa, aaa_tv, context)
+    assert by_symbol["AAA"].tradingview == pytest.approx(aaa_tv)
 
-    # BBB loses only its missing 4h contribution: tv from "1d" alone.
-    bbb = by_symbol["BBB"]
+    # BBB loses only its missing 4h contribution: the aggregate is "1d" alone, not zero.
     bbb_tv = float(LABEL_VALUES[table[("BBB", "1d")]])
-    assert bbb.score is not None
-    assert bbb.score == _reference_score(bbb, bbb_tv, context)
+    assert by_symbol["BBB"].tradingview == pytest.approx(bbb_tv)
 
 
 def test_scan_chunks_batch_requests_end_to_end_over_a_large_watchlist() -> None:
@@ -636,7 +517,6 @@ def test_scan_chunks_batch_requests_end_to_end_over_a_large_watchlist() -> None:
         analysis=tv,
         watchlist=watchlist,
         timeframes=timeframes,
-        quality_threshold=0.0,
     )
 
     expected_chunks = ceil(len(watchlist) / batch_size)  # ceil(5/2) = 3

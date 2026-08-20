@@ -17,17 +17,12 @@ from trader.backtester import (
     _run_lifecycle,
     evaluate_at,
     market_context_at,
-    neutral_order_book,
 )
-from trader.config import CATEGORY_LIQUIDITY, Config
-from trader.direction import Direction, MarketContext, decide
-from trader.indicators import compute_features
+from trader.config import Config, StrategyConfig
+from trader.direction import Direction, MarketContext
 from trader.market_data import Candles
 from trader.metrics import summarize
 from trader.replay import Replay, timeframe_to_ms
-from trader.scoring_model import ScoringModel
-from trader.structure import analyze as analyze_structure
-from trader.trade_planner import TradePlanner
 from trader.trade_simulator import TradeOutcome, TradeResult
 
 _HOUR = 3_600_000
@@ -69,12 +64,14 @@ def _config() -> Config:
         reference_timeframe="4h",
         lead_timeframe="4h",
         htf_timeframes=["4h"],
-        quality_threshold=0.0,
+        # Replay machinery under test, not the method: a synthetic series cannot satisfy a
+        # seven-condition checklist, and leaving it on would pin zero trades.
+        strategies=StrategyConfig(enabled=False),
     )
 
 
 def _aligned_frames(
-    symbol: str, reference_bars: int = 80, *, kind: str = "bull"
+    symbol: str, reference_bars: int = 260, *, kind: str = "bull"
 ) -> dict[str, Candles]:
     span = 4 * _HOUR * reference_bars
     make = _bullish_frame if kind == "bull" else _bearish_frame
@@ -144,67 +141,6 @@ def test_btc_context_is_point_in_time_and_ignores_a_future_spike() -> None:
 # --------------------------------------------------------------------------------------
 # Neutral full-credit liquidity — backtest score equals the live pipeline's score.
 # --------------------------------------------------------------------------------------
-
-
-def test_neutral_liquidity_gives_full_credit_and_matches_live_pipeline_score() -> None:
-    config = _config()
-    frames = _aligned_frames("AAA")
-    ts = Replay(frames, config.reference_timeframe).reference_closes()[-1]
-
-    evaluation = evaluate_at(frames, ts, MarketContext(), config)
-    assert evaluation.score is not None
-    liquidity = evaluation.score.category(CATEGORY_LIQUIDITY)
-    assert liquidity is not None
-    assert liquidity.fraction == 1.0  # full credit despite no historical order book
-
-    # Recompute the score exactly as the live per-coin pipeline would, with the neutral
-    # order book, over the identically-sliced inputs; the totals must be equal. The
-    # pipeline bounds the slice to the live-scan lookback, so mirror that window here.
-    sliced = Replay(
-        frames, config.reference_timeframe, max_bars=config.ohlcv_lookback
-    ).slice_at(ts)
-    features = {tf: compute_features(c) for tf, c in sliced.items()}
-    structure = {tf: analyze_structure(c) for tf, c in sliced.items()}
-    direction = decide(
-        features,
-        structure,
-        MarketContext(),
-        htf_timeframes=tuple(config.htf_timeframes),
-        lead_timeframe=config.lead_timeframe,
-    ).direction
-    plan = TradePlanner().plan(
-        direction,
-        sliced[config.reference_timeframe],
-        structure[config.reference_timeframe],
-        features[config.reference_timeframe].atr,
-        atr_buffer=config.atr_buffer,
-        target_rr=config.target_rr,
-    )
-    assert plan is not None
-    expected = ScoringModel().score(
-        symbol="AAA",
-        direction=direction,
-        features_by_tf=features,
-        structure_by_tf=structure,
-        btc_context=MarketContext(),
-        weights=config.category_weights,
-        tradingview=None,
-        order_book=neutral_order_book("AAA"),
-        close_by_tf={tf: c.latest_close for tf, c in sliced.items()},
-        relative_volume_multiple=config.relative_volume_multiple,
-        min_depth=config.min_depth,
-        max_spread=config.max_spread,
-        risk_reward=plan.risk_reward,
-        target_rr=config.target_rr,
-    )
-    assert evaluation.score.total == expected.total
-
-
-# --------------------------------------------------------------------------------------
-# Lifecycle — one position per coin, enter only on a fresh transition.
-# --------------------------------------------------------------------------------------
-
-
 def _fake_outcome(exit_time: int | None) -> TradeOutcome:
     return TradeOutcome(
         symbol="AAA",
